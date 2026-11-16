@@ -1098,6 +1098,11 @@ final class KoEnFixEngine {
             return Unmanaged.passRetained(event)
         }
 
+        // Quote (keyCode 39): `'` unshifted, `"` with Shift
+        if keyCode == 39 {
+            return handleQuoteKey(inKorean: inKorean, quote: hasShift ? "\"" : "'", originalEvent: event)
+        }
+
         // Any other key (numbers, punctuation, arrows, Escape, Tab, etc.) resets word tracking
         resetTracking()
         return Unmanaged.passRetained(event)
@@ -1190,6 +1195,34 @@ final class KoEnFixEngine {
         }
 
         let sim = buffer.snapshot()
+        if autoConvertWord(sim, inKorean: inKorean, terminator: " ") {
+            return nil // Suppress original Space; our replacement appends " "
+        }
+
+        // Not auto-converted: remember this word in case the user presses Shift+Space right after Space!
+        lastWordBeforeSpace = (sim: sim, wasKorean: inKorean)
+        return Unmanaged.passRetained(originalEvent)
+    }
+
+    /// A closing `'` or `"` ends the word like Space does ("tlgja" -> "시험").
+    private func handleQuoteKey(inKorean: Bool, quote: String, originalEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        cancelPendingEnToKoUndo()
+        lastWordBeforeSpace = nil
+        guard !buffer.isEmpty else {
+            resetTracking()
+            return Unmanaged.passRetained(originalEvent)
+        }
+        let sim = buffer.snapshot()
+        if autoConvertWord(sim, inKorean: inKorean, terminator: quote) {
+            return nil // Suppress original quote; our replacement appends it
+        }
+        resetTracking()
+        return Unmanaged.passRetained(originalEvent)
+    }
+
+    /// Clears the word buffer and, when the word is a typo, replaces it plus `terminator`.
+    /// Returns true when the replacement was posted and the original key must be swallowed.
+    private func autoConvertWord(_ sim: SimulationResult, inKorean: Bool, terminator: String) -> Bool {
         let prefix = currentPrefixSymbol
         buffer.reset()
         currentPrefixSymbol = nil
@@ -1199,11 +1232,11 @@ final class KoEnFixEngine {
             performReplacement(
                 deleteCount: sim.backspacesInKoreanComposing,
                 switchToKorean: false,
-                insertText: sim.englishText + " ",
+                insertText: sim.englishText + terminator,
                 fromLabel: sim.koreanText,
                 toLabel: sim.englishText
             )
-            return nil // Suppress original Space; our replacement appends " "
+            return true
         }
 
         if !inKorean && TypoDetector.shouldAutoConvertEnToKo(
@@ -1212,24 +1245,21 @@ final class KoEnFixEngine {
             learned: learnedList.lookup(sim.englishText)
         ) {
             lastWordBeforeSpace = nil
-            // korean syllables plus the trailing space we insert.
+            // Korean syllables plus the trailing terminator we insert.
             pendingEnToKoUndo = PendingEnToKoUndo(
                 english: sim.englishText,
-                insertedCharacterCount: sim.koreanText.count + 1
+                insertedCharacterCount: sim.koreanText.count + terminator.count
             )
             performReplacement(
                 deleteCount: sim.backspacesInEnglish,
                 switchToKorean: true,
-                insertText: sim.koreanText + " ",
+                insertText: sim.koreanText + terminator,
                 fromLabel: sim.englishText,
                 toLabel: sim.koreanText
             )
-            return nil // Suppress original Space; our replacement appends " "
+            return true
         }
-
-        // Not auto-converted: remember this word in case the user presses Shift+Space right after Space!
-        lastWordBeforeSpace = (sim: sim, wasKorean: inKorean)
-        return Unmanaged.passRetained(originalEvent)
+        return false
     }
 
     private func handleEnterKey(inKorean: Bool, originalEvent: CGEvent) -> Unmanaged<CGEvent>? {
