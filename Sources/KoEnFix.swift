@@ -3,7 +3,8 @@ import Carbon
 
 // MARK: - Constants & Types
 
-private let SELF_EVENT_TAG: Int64 = 0x4B4F_454E // "KOEN"
+private let SELF_EVENT_TAG: Int64   = 0x4B4F_454E // "KOEN"
+private let REPLAY_EVENT_TAG: Int64 = 0x4B4F_5250 // "KORP"
 
 /// What the user taught the app about one English keystroke string.
 enum LearnedEnToKo: Equatable {
@@ -737,23 +738,89 @@ enum TypoDetector {
     }
 }
 
-// MARK: - macOS Input Source Manager (Carbon TIS)
+// MARK: - macOS Input Source Manager (Carbon TIS + CJKV Focus/Shortcut Sync)
+
+private final class TemporaryInputWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
 
 enum InputSourceManager {
+    struct SymbolicHotKey: Equatable {
+        let keyCode: CGKeyCode
+        let modifiers: CGEventFlags
+    }
+
     static let koreanSourceID = "com.apple.inputmethod.Korean.2SetKorean"
     static let englishSourceID = "com.apple.keylayout.ABC"
 
-    static func currentSourceID() -> String {
-        guard let src = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-              let ptr = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else {
+    private static var temporaryWindow: TemporaryInputWindow?
+
+    static func sourceID(of source: TISInputSource) -> String {
+        guard let ptr = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
             return ""
         }
         return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
     }
 
-    static func isKoreanActive() -> Bool {
-        let id = currentSourceID()
+    private static func boolProperty(_ source: TISInputSource, _ key: CFString) -> Bool {
+        guard let ptr = TISGetInputSourceProperty(source, key) else { return false }
+        return Unmanaged<CFBoolean>.fromOpaque(ptr).takeUnretainedValue() == kCFBooleanTrue
+    }
+
+    private static func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
+        guard let ptr = TISGetInputSourceProperty(source, key) else { return nil }
+        return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
+    }
+
+    static func isKoreanSourceID(_ id: String) -> Bool {
         return id.contains("Korean") || id.contains("Hangul") || id.contains("Gureum")
+    }
+
+    static func currentSourceID() -> String {
+        guard let src = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
+            return ""
+        }
+        return sourceID(of: src)
+    }
+
+    static func isKoreanActive() -> Bool {
+        return isKoreanSourceID(currentSourceID())
+    }
+
+    static func selectableKeyboardSources() -> [TISInputSource] {
+        guard let cfList = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] else {
+            return []
+        }
+        let kbdCategory = kTISCategoryKeyboardInputSource as String
+        return cfList.filter { src in
+            stringProperty(src, kTISPropertyInputSourceCategory) == kbdCategory &&
+            boolProperty(src, kTISPropertyInputSourceIsSelectCapable) &&
+            boolProperty(src, kTISPropertyInputSourceIsEnabled)
+        }
+    }
+
+    static func preferredKoreanSource() -> TISInputSource? {
+        let sources = selectableKeyboardSources()
+        if let exact = sources.first(where: { sourceID(of: $0) == koreanSourceID }) {
+            return exact
+        }
+        return sources.first(where: { isKoreanSourceID(sourceID(of: $0)) })
+    }
+
+    static func preferredEnglishSource() -> TISInputSource? {
+        let sources = selectableKeyboardSources()
+        if let abc = sources.first(where: { sourceID(of: $0) == englishSourceID }) {
+            return abc
+        }
+        if let us = sources.first(where: { sourceID(of: $0) == "com.apple.keylayout.US" }) {
+            return us
+        }
+        if let ascii = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+           !isKoreanSourceID(sourceID(of: ascii)) {
+            return ascii
+        }
+        return sources.first(where: { !isKoreanSourceID(sourceID(of: $0)) })
     }
 
     @discardableResult
@@ -763,26 +830,236 @@ enum InputSourceManager {
               let source = cfList.first else {
             return false
         }
-        let status = TISSelectInputSource(source)
-        return status == noErr
+        return TISSelectInputSource(source) == noErr
     }
 
-    static func switchToEnglish() {
-        if !selectInputSource(id: englishSourceID) {
-            _ = selectInputSource(id: "com.apple.keylayout.US")
+    @discardableResult
+    static func switchToEnglish() -> Bool {
+        if let src = preferredEnglishSource() {
+            return TISSelectInputSource(src) == noErr
+        }
+        if selectInputSource(id: englishSourceID) {
+            return true
+        }
+        return selectInputSource(id: "com.apple.keylayout.US")
+    }
+
+    @discardableResult
+    static func switchToKorean() -> Bool {
+        if let src = preferredKoreanSource() {
+            return TISSelectInputSource(src) == noErr
+        }
+        return selectInputSource(id: koreanSourceID)
+    }
+
+    /// Converts legacy Carbon modifier bitmasks from `com.apple.symbolichotkeys` to `CGEventFlags`.
+    static func convertCarbonModifiersToCGFlags(_ carbonFlags: Int) -> CGEventFlags {
+        var flags: CGEventFlags = []
+        if (carbonFlags & 131072) != 0  { flags.insert(.maskShift) }
+        if (carbonFlags & 262144) != 0  { flags.insert(.maskControl) }
+        if (carbonFlags & 524288) != 0  { flags.insert(.maskAlternate) }
+        if (carbonFlags & 1048576) != 0 { flags.insert(.maskCommand) }
+        return flags
+    }
+
+    /// Parses a symbolic hotkey entry (`"60"` = previous input source, `"61"` = next input source).
+    static func parseSymbolicHotKey(from hotKeys: [String: Any], id: String) -> SymbolicHotKey? {
+        guard let entry = hotKeys[id] as? [String: Any] else { return nil }
+        if let enabled = entry["enabled"] as? Bool, !enabled {
+            return nil
+        }
+        guard let value = entry["value"] as? [String: Any],
+              let params = value["parameters"] as? [Int],
+              params.count >= 3 else {
+            return nil
+        }
+        let rawKeyCode = params[1]
+        let rawModifiers = params[2]
+        guard rawKeyCode >= 0 && rawKeyCode < 128 else { return nil }
+        let modifiers = convertCarbonModifiersToCGFlags(rawModifiers)
+        guard !modifiers.isEmpty else { return nil }
+        return SymbolicHotKey(keyCode: CGKeyCode(rawKeyCode), modifiers: modifiers)
+    }
+
+    static func previousInputSourceHotKey() -> SymbolicHotKey? {
+        guard let domain = UserDefaults.standard.persistentDomain(forName: "com.apple.symbolichotkeys"),
+              let hotKeys = domain["AppleSymbolicHotKeys"] as? [String: Any] else {
+            return nil
+        }
+        if let prev = parseSymbolicHotKey(from: hotKeys, id: "60") {
+            return prev
+        }
+        // When only 2 keyboard input sources are enabled, "Select next source" (61) reaches the exact same target.
+        if selectableKeyboardSources().count == 2,
+           let next = parseSymbolicHotKey(from: hotKeys, id: "61") {
+            return next
+        }
+        return nil
+    }
+
+    /// Reliably switches the focused app's active input context to English (`ABC`).
+    /// Must be called from `workerQueue` (never the main thread).
+    static func activateEnglishFromWorker(postShortcut: (SymbolicHotKey) -> Void) {
+        DispatchQueue.main.sync {
+            _ = switchToEnglish()
+        }
+        usleep(25_000)
+
+        let stillKorean = DispatchQueue.main.sync { isKoreanActive() }
+        guard stillKorean else { return }
+
+        DispatchQueue.main.sync {
+            _ = switchToEnglish()
+        }
+        usleep(20_000)
+
+        let stillKoreanAfterRetry = DispatchQueue.main.sync { isKoreanActive() }
+        if stillKoreanAfterRetry, let hotKey = DispatchQueue.main.sync(execute: { previousInputSourceHotKey() }) {
+            postShortcut(hotKey)
+            usleep(35_000)
         }
     }
 
-    static func switchToKorean() {
-        _ = selectInputSource(id: koreanSourceID)
+    /// Reliably switches the focused app's active input context to Korean (`2SetKorean`).
+    /// Calling `TISSelectInputSource` directly on a CJKV `InputMode` from a background `LSUIElement`
+    /// updates only the menu-bar icon while leaving the focused app's `TSMDocument` in `ABC`.
+    /// Must be called from `workerQueue` (never the main thread).
+    static func activateKoreanFromWorker(postShortcut: (SymbolicHotKey) -> Void) {
+        // Tier 1: Native WindowServer input-source shortcut (zero focus change).
+        let prep: (hotKey: SymbolicHotKey?, targetID: String, needsBounceWait: Bool, needsEnglishReset: Bool) = DispatchQueue.main.sync {
+            let hotKey = previousInputSourceHotKey()
+            let koSrc = preferredKoreanSource()
+            let targetID = koSrc.map { sourceID(of: $0) } ?? koreanSourceID
+            let kbdCount = selectableKeyboardSources().count
+            let currentlyKorean = isKoreanActive()
+
+            if hotKey != nil, let koSrc = koSrc, kbdCount > 2 {
+                // Put target Korean source into MRU history right before bouncing to English.
+                _ = TISSelectInputSource(koSrc)
+                return (hotKey, targetID, true, true)
+            }
+            return (hotKey, targetID, false, currentlyKorean)
+        }
+
+        if let hotKey = prep.hotKey {
+            if prep.needsBounceWait {
+                usleep(20_000)
+            }
+            if prep.needsEnglishReset {
+                // Ensure TIS is synced to English (`ABC`) before firing "Select previous input source",
+                // even if an earlier out-of-focus TIS call left the menu bar stuck on Korean.
+                DispatchQueue.main.sync {
+                    _ = switchToEnglish()
+                }
+                usleep(20_000)
+            }
+
+            postShortcut(hotKey)
+
+            for _ in 0..<15 {
+                usleep(8_000)
+                let activated = DispatchQueue.main.sync {
+                    let cur = currentSourceID()
+                    return cur == prep.targetID || isKoreanSourceID(cur)
+                }
+                if activated {
+                    // Allow KoreanIM session activation to finish settling on the focused app.
+                    usleep(15_000)
+                    return
+                }
+            }
+        }
+
+        // Tier 2 Fallback (when shortcut 60 is disabled or intercepted):
+        // Select Korean in TIS and briefly activate a 3x3 transparent NSTextView window so
+        // macOS completes the CJKV IMKServer handoff, then restore focus to the previous app.
+        activateKoreanViaTemporaryWindow()
     }
 
-    static func toggle() {
-        if isKoreanActive() {
-            switchToEnglish()
+    private static func activateKoreanViaTemporaryWindow() {
+        let selfBundleID = Bundle.main.bundleIdentifier
+        let previousApp: NSRunningApplication? = DispatchQueue.main.sync {
+            let front = NSWorkspace.shared.frontmostApplication
+            _ = switchToKorean()
+            showTemporaryInputWindowOnMain()
+            if front?.bundleIdentifier != selfBundleID {
+                return front
+            }
+            return nil
+        }
+
+        usleep(85_000)
+
+        DispatchQueue.main.sync {
+            hideTemporaryInputWindowOnMain()
+            if let prev = previousApp {
+                _ = prev.activate(options: [])
+            }
+        }
+
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        for _ in 0..<15 {
+            let frontPID = DispatchQueue.main.sync {
+                NSWorkspace.shared.frontmostApplication?.processIdentifier
+            }
+            if let frontPID, frontPID != selfPID {
+                break
+            }
+            usleep(10_000)
+        }
+
+        DispatchQueue.main.sync {
+            if !isKoreanActive() {
+                _ = switchToKorean()
+            }
+        }
+        usleep(15_000)
+    }
+
+    private static func showTemporaryInputWindowOnMain() {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let frame = screen.visibleFrame
+        let size = NSSize(width: 3, height: 3)
+        let rect = NSRect(
+            x: frame.maxX - size.width - 8,
+            y: frame.minY + 8,
+            width: size.width,
+            height: size.height
+        )
+        let win: TemporaryInputWindow
+        if let existing = temporaryWindow {
+            existing.setFrame(rect, display: false)
+            win = existing
         } else {
-            switchToKorean()
+            let created = TemporaryInputWindow(
+                contentRect: rect,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            created.isReleasedWhenClosed = false
+            created.isOpaque = false
+            created.backgroundColor = .clear
+            created.alphaValue = 0.01
+            created.hasShadow = false
+            created.ignoresMouseEvents = true
+            created.level = .screenSaver
+            created.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            created.contentView = NSTextView(frame: NSRect(origin: .zero, size: size))
+            temporaryWindow = created
+            win = created
         }
+
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if let textView = win.contentView {
+            win.makeFirstResponder(textView)
+        }
+    }
+
+    private static func hideTemporaryInputWindowOnMain() {
+        guard let win = temporaryWindow else { return }
+        win.orderOut(nil)
     }
 }
 
@@ -913,7 +1190,20 @@ final class KoEnFixEngine {
     /// Set after Space auto-converts English → Korean. Cleared unless the next
     /// keys are Backspaces that erase that insertion.
     private var pendingEnToKoUndo: PendingEnToKoUndo?
-    private var isReplacing: Bool = false
+
+    private let stateLock = NSLock()
+    private var isReplacingStorage: Bool = false
+    private var deferredUserKeys: [(keyCode: CGKeyCode, isShift: Bool)] = []
+    private var ignoreSourceChangeNotificationsUntil: TimeInterval = 0
+    private var sourceChangeObserverInstalled: Bool = false
+    private let selfPID: Int64 = Int64(ProcessInfo.processInfo.processIdentifier)
+
+    private var isReplacing: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isReplacingStorage
+    }
+
     private let workerQueue = DispatchQueue(label: "com.dave.koen-fix.worker", qos: .userInteractive)
     fileprivate var eventTap: CFMachPort?
 
@@ -929,6 +1219,38 @@ final class KoEnFixEngine {
             convertOnTerminalEnter = UserDefaults.standard.bool(forKey: "convertOnTerminalEnter")
         }
         learnedList = LearnedEnToKoList.loadFromDefaults()
+    }
+
+    private func beginReplacing() {
+        stateLock.lock()
+        isReplacingStorage = true
+        deferredUserKeys.removeAll()
+        ignoreSourceChangeNotificationsUntil = ProcessInfo.processInfo.systemUptime + 0.6
+        stateLock.unlock()
+    }
+
+    private func enqueueDeferredUserKey(keyCode: CGKeyCode, isShift: Bool) {
+        stateLock.lock()
+        if deferredUserKeys.count < 16 {
+            deferredUserKeys.append((keyCode: keyCode, isShift: isShift))
+        }
+        stateLock.unlock()
+    }
+
+    private func finishReplacingAndTakeDeferredKeys() -> [(keyCode: CGKeyCode, isShift: Bool)] {
+        stateLock.lock()
+        isReplacingStorage = false
+        ignoreSourceChangeNotificationsUntil = ProcessInfo.processInfo.systemUptime + 0.35
+        let queued = deferredUserKeys
+        deferredUserKeys.removeAll()
+        stateLock.unlock()
+        return queued
+    }
+
+    private func shouldHandleExternalSourceChange() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return !isReplacingStorage && ProcessInfo.processInfo.systemUptime >= ignoreSourceChangeNotificationsUntil
     }
 
     func clearLearnedWords() {
@@ -1013,16 +1335,58 @@ final class KoEnFixEngine {
         let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        installSourceChangeObserverIfNeeded()
         return true
     }
 
+    private func installSourceChangeObserverIfNeeded() {
+        guard !sourceChangeObserverInstalled else { return }
+        sourceChangeObserverInstalled = true
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.shouldHandleExternalSourceChange() else { return }
+            self.buffer.reset()
+            self.currentPrefixSymbol = nil
+            self.lastWordBeforeSpace = nil
+        }
+    }
+
     private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        let userData = event.getIntegerValueField(.eventSourceUserData)
         // Ignore our own synthetic events
-        if event.getIntegerValueField(.eventSourceUserData) == SELF_EVENT_TAG {
+        if userData == SELF_EVENT_TAG {
+            return Unmanaged.passRetained(event)
+        }
+        if userData != REPLAY_EVENT_TAG &&
+           isReplacing &&
+           event.getIntegerValueField(.eventSourceUnixProcessID) == selfPID {
             return Unmanaged.passRetained(event)
         }
 
-        guard isEnabled, !isReplacing else {
+        guard isEnabled else {
+            return Unmanaged.passRetained(event)
+        }
+
+        // While replacing & switching input sources, hold fast follow-up keystrokes and replay
+        // them once the target input language is active so the next word starts in the new language.
+        if isReplacing {
+            if type == .keyDown {
+                let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+                let flags = event.flags
+                let isBareModifier = (54...63).contains(Int(keyCode))
+                if !isBareModifier &&
+                   !flags.contains(.maskCommand) &&
+                   !flags.contains(.maskControl) &&
+                   !flags.contains(.maskAlternate) {
+                    enqueueDeferredUserKey(keyCode: keyCode, isShift: flags.contains(.maskShift))
+                    return nil
+                }
+            } else if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
+                resetTracking()
+            }
             return Unmanaged.passRetained(event)
         }
 
@@ -1181,8 +1545,8 @@ final class KoEnFixEngine {
             // Finished Hangul is already committed. Leave the word and toggle the IME below.
         }
 
-        // Case 3: Buffer is empty -> simply toggle Korean/English IME
-        InputSourceManager.toggle()
+        // Case 3: Buffer is empty -> reliably toggle Korean/English IME
+        performInputSourceToggle(currentlyKorean: inKorean)
         return nil
     }
 
@@ -1301,6 +1665,18 @@ final class KoEnFixEngine {
     ///   1) Send `deleteCount` Backspaces while STILL in English (`ABC`) mode
     ///   2) Inject composed Korean Unicode text while STILL in `ABC` mode (bypasses KoreanIM composition!)
     ///   3) Switch input source to Korean (`2SetKorean`)
+    private func performInputSourceToggle(currentlyKorean: Bool) {
+        beginReplacing()
+        workerQueue.async { [weak self] in
+            if currentlyKorean {
+                InputSourceManager.activateEnglishFromWorker(postShortcut: Self.postSymbolicHotKey)
+            } else {
+                InputSourceManager.activateKoreanFromWorker(postShortcut: Self.postSymbolicHotKey)
+            }
+            self?.completeReplacingAndReplay()
+        }
+    }
+
     private func performReplacement(
         deleteCount: Int,
         switchToKorean: Bool,
@@ -1308,15 +1684,10 @@ final class KoEnFixEngine {
         fromLabel: String,
         toLabel: String
     ) {
-        isReplacing = true
+        beginReplacing()
         recordConversion(from: fromLabel, to: toLabel)
 
         workerQueue.async { [weak self] in
-            defer {
-                usleep(15_000)
-                self?.isReplacing = false
-            }
-
             let src = CGEventSource(stateID: .privateState)
 
             // Phase 1: Delete existing characters in the CURRENT input mode
@@ -1334,33 +1705,125 @@ final class KoEnFixEngine {
                 Self.postUnicodeString(insertText, source: src)
                 usleep(18_000)
 
-                // Phase 3: Switch IME to Korean (with retry check)
-                DispatchQueue.main.sync {
-                    InputSourceManager.switchToKorean()
-                }
-                usleep(12_000)
-                if !InputSourceManager.isKoreanActive() {
-                    DispatchQueue.main.sync {
-                        InputSourceManager.switchToKorean()
-                    }
-                }
+                // Phase 3: Activate Korean in the focused app's TSMDocument (not just the menu-bar icon)
+                InputSourceManager.activateKoreanFromWorker(postShortcut: Self.postSymbolicHotKey)
             } else {
                 // Direction: Korean -> English
-                // Phase 2: Switch IME to English (ABC) first
-                DispatchQueue.main.sync {
-                    InputSourceManager.switchToEnglish()
-                }
-                usleep(18_000)
-                if InputSourceManager.isKoreanActive() {
-                    DispatchQueue.main.sync {
-                        InputSourceManager.switchToEnglish()
-                    }
-                    usleep(12_000)
-                }
+                // Phase 2: Switch IME to English (ABC) first so KoreanIM deactivates before English text arrives
+                InputSourceManager.activateEnglishFromWorker(postShortcut: Self.postSymbolicHotKey)
 
                 // Phase 3: Inject English text now that ABC is active
                 Self.postUnicodeString(insertText, source: src)
             }
+
+            self?.completeReplacingAndReplay()
+        }
+    }
+
+    private func completeReplacingAndReplay() {
+        usleep(10_000)
+        let queued = finishReplacingAndTakeDeferredKeys()
+        guard !queued.isEmpty else { return }
+        for item in queued {
+            Self.postReplayedUserKey(keyCode: item.keyCode, isShift: item.isShift)
+        }
+    }
+
+    private static func modifierKeyCodes(for flags: CGEventFlags) -> [CGKeyCode] {
+        var codes: [CGKeyCode] = []
+        if flags.contains(.maskControl)   { codes.append(59) } // kVK_Control
+        if flags.contains(.maskAlternate) { codes.append(58) } // kVK_Option
+        if flags.contains(.maskShift)     { codes.append(56) } // kVK_Shift
+        if flags.contains(.maskCommand)   { codes.append(55) } // kVK_Command
+        return codes
+    }
+
+    /// Synthesizes a full hardware-level modifier + key + modifier-release sequence for a macOS SymbolicHotKey.
+    /// Preserves native `NX_DEVICE*` modifier bits so `TextInputMenuAgent` immediately commits without leaving HUD open.
+    private static func postSymbolicHotKey(_ hotKey: InputSourceManager.SymbolicHotKey) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        let modCodes = modifierKeyCodes(for: hotKey.modifiers)
+        guard !modCodes.isEmpty else { return }
+
+        var activeFlags: CGEventFlags = []
+        var prefixFlags: [CGEventFlags] = []
+
+        for modCode in modCodes {
+            prefixFlags.append(activeFlags)
+            guard let modDown = CGEvent(keyboardEventSource: src, virtualKey: modCode, keyDown: true) else {
+                continue
+            }
+            activeFlags.formUnion(modDown.flags)
+            modDown.flags = activeFlags
+            modDown.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
+            modDown.post(tap: .cghidEventTap)
+            usleep(4_000)
+        }
+
+        if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: true),
+           let keyUp = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: false) {
+            keyDown.flags = activeFlags
+            keyUp.flags = activeFlags
+            keyDown.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
+            keyUp.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
+            keyDown.post(tap: .cghidEventTap)
+            usleep(4_000)
+            keyUp.post(tap: .cghidEventTap)
+            usleep(4_000)
+        }
+
+        for (idx, modCode) in modCodes.enumerated().reversed() {
+            guard let modUp = CGEvent(keyboardEventSource: src, virtualKey: modCode, keyDown: false) else {
+                continue
+            }
+            if idx > 0 {
+                modUp.flags = prefixFlags[idx]
+            }
+            modUp.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
+            modUp.post(tap: .cghidEventTap)
+            usleep(2_500)
+        }
+    }
+
+    private static func postReplayedUserKey(keyCode: CGKeyCode, isShift: Bool) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        if isShift {
+            let shiftDown = CGEvent(keyboardEventSource: src, virtualKey: 56, keyDown: true)
+            let shiftFlags = shiftDown?.flags ?? [.maskShift]
+            if let shiftDown {
+                shiftDown.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
+                shiftDown.post(tap: .cghidEventTap)
+                usleep(2_000)
+            }
+            if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
+               let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
+                down.flags = shiftFlags
+                up.flags = shiftFlags
+                down.setIntegerValueField(.eventSourceUserData, value: REPLAY_EVENT_TAG)
+                up.setIntegerValueField(.eventSourceUserData, value: REPLAY_EVENT_TAG)
+                down.post(tap: .cghidEventTap)
+                usleep(2_000)
+                up.post(tap: .cghidEventTap)
+                usleep(2_000)
+            }
+            if let shiftUp = CGEvent(keyboardEventSource: src, virtualKey: 56, keyDown: false) {
+                shiftUp.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
+                shiftUp.post(tap: .cghidEventTap)
+                usleep(2_000)
+            }
+        } else {
+            guard let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) else {
+                return
+            }
+            down.flags = []
+            up.flags = []
+            down.setIntegerValueField(.eventSourceUserData, value: REPLAY_EVENT_TAG)
+            up.setIntegerValueField(.eventSourceUserData, value: REPLAY_EVENT_TAG)
+            down.post(tap: .cghidEventTap)
+            usleep(2_000)
+            up.post(tap: .cghidEventTap)
+            usleep(2_500)
         }
     }
 
@@ -1865,6 +2328,56 @@ func runSelfTests() -> Int32 {
         expect(!undo.noteBackspace(), "The second backspace leaves part of the insertion")
         expect(!undo.noteBackspace(), "The third backspace leaves part of the insertion")
         expect(undo.noteBackspace(), "The fourth backspace erases the automatic conversion")
+    }
+
+    // 6. Symbolic hotkey parsing & input source classification tests
+    do {
+        let hotKeys: [String: Any] = [
+            "60": [
+                "enabled": true,
+                "value": [
+                    "parameters": [32, 49, 262144],
+                    "type": "standard"
+                ]
+            ],
+            "61": [
+                "enabled": false,
+                "value": [
+                    "parameters": [32, 49, 786432],
+                    "type": "standard"
+                ]
+            ],
+            "invalidKeyCode": [
+                "enabled": true,
+                "value": [
+                    "parameters": [65535, 65535, 262144],
+                    "type": "standard"
+                ]
+            ]
+        ]
+
+        let parsed60 = InputSourceManager.parseSymbolicHotKey(from: hotKeys, id: "60")
+        expect(
+            parsed60 == InputSourceManager.SymbolicHotKey(keyCode: 49, modifiers: [.maskControl]),
+            "SymbolicHotKey 60 parses Ctrl+Space (keyCode 49, .maskControl)"
+        )
+        expect(
+            InputSourceManager.parseSymbolicHotKey(from: hotKeys, id: "61") == nil,
+            "Disabled SymbolicHotKey 61 returns nil"
+        )
+        expect(
+            InputSourceManager.parseSymbolicHotKey(from: hotKeys, id: "invalidKeyCode") == nil,
+            "Out-of-range keyCode 65535 returns nil"
+        )
+
+        let ctrlOptFlags = InputSourceManager.convertCarbonModifiersToCGFlags(786432)
+        expect(
+            ctrlOptFlags == [.maskControl, .maskAlternate],
+            "Carbon modifier 786432 maps to [.maskControl, .maskAlternate]"
+        )
+
+        expect(InputSourceManager.isKoreanSourceID("com.apple.inputmethod.Korean.2SetKorean"), "2SetKorean is recognized as Korean")
+        expect(!InputSourceManager.isKoreanSourceID("com.apple.keylayout.ABC"), "ABC is recognized as non-Korean")
     }
 
     if failures == 0 {
