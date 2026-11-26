@@ -857,7 +857,7 @@ These need a real keyboard and IME session, so only the user can run them. They 
 | a | Terminal, 한글 모드: `ㅣㄴ` + Ctrl+U | `ls`가 입력되고 줄이 지워지고 영문 모드 |
 | b | VS Code, 한글 모드: Ctrl+P | 영문 모드에서 팔레트가 열리고 영문으로 입력됨 |
 | c | VS Code, 한글 모드: Ctrl+Shift+P | 영문 모드에서 명령 팔레트가 열림 |
-| d | tmux, 한글 모드: Ctrl+B 뒤에 `d` | 영문 모드라 `d`가 그대로 전달되어 detach |
+| d | tmux, 한글 모드: 접두어 Ctrl+B | 영문 모드로 바뀐 뒤 Ctrl+B가 tmux에 전달되어 접두어로 인식됨. 한글 모드에서는 Ctrl+ㅠ으로 가서 인식되지 않던 문제. 이어서 누르는 `d`도 영문으로 전달되어 detach |
 | e | 한글 모드: Ctrl+Space | 시스템 토글만 동작. 한 번만 바뀜 |
 | f | 영문 모드: Ctrl+P | 아무 변화 없음 |
 | g | Terminal, 한글 모드: `abc`를 치고 Ctrl를 누른 채 Ctrl+A, Ctrl+E | 커서가 `abc` 뒤에 있음. 순서가 뒤바뀌면 앞에 놓임 |
