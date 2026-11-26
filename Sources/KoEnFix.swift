@@ -1291,6 +1291,13 @@ final class KoEnFixEngine {
         }
     }
 
+    var switchToEnglishOnCtrlCombo: Bool = true {
+        didSet {
+            UserDefaults.standard.set(switchToEnglishOnCtrlCombo, forKey: "switchToEnglishOnCtrlCombo")
+            onStateChange?()
+        }
+    }
+
     private(set) var recentConversions: [String] = []
     private(set) var learnedList = LearnedEnToKoList()
     var onStateChange: (() -> Void)?
@@ -1306,7 +1313,7 @@ final class KoEnFixEngine {
 
     private let stateLock = NSLock()
     private var isReplacingStorage: Bool = false
-    private var deferredUserKeys: [(keyCode: CGKeyCode, isShift: Bool)] = []
+    private var deferredUserKeys = DeferredKeyQueue()
     private var ignoreSourceChangeNotificationsUntil: TimeInterval = 0
     private var sourceChangeObserverInstalled: Bool = false
     private let selfPID: Int64 = Int64(ProcessInfo.processInfo.processIdentifier)
@@ -1331,6 +1338,9 @@ final class KoEnFixEngine {
         if UserDefaults.standard.object(forKey: "convertOnTerminalEnter") != nil {
             convertOnTerminalEnter = UserDefaults.standard.bool(forKey: "convertOnTerminalEnter")
         }
+        if UserDefaults.standard.object(forKey: "switchToEnglishOnCtrlCombo") != nil {
+            switchToEnglishOnCtrlCombo = UserDefaults.standard.bool(forKey: "switchToEnglishOnCtrlCombo")
+        }
         learnedList = LearnedEnToKoList.loadFromDefaults()
     }
 
@@ -1342,20 +1352,17 @@ final class KoEnFixEngine {
         stateLock.unlock()
     }
 
-    private func enqueueDeferredUserKey(keyCode: CGKeyCode, isShift: Bool) {
+    private func enqueueDeferredUserKey(_ key: DeferredUserKey) {
         stateLock.lock()
-        if deferredUserKeys.count < 16 {
-            deferredUserKeys.append((keyCode: keyCode, isShift: isShift))
-        }
+        deferredUserKeys.enqueue(key)
         stateLock.unlock()
     }
 
-    private func finishReplacingAndTakeDeferredKeys() -> [(keyCode: CGKeyCode, isShift: Bool)] {
+    private func finishReplacingAndTakeDeferredKeys() -> [DeferredUserKey] {
         stateLock.lock()
         isReplacingStorage = false
         ignoreSourceChangeNotificationsUntil = ProcessInfo.processInfo.systemUptime + 0.35
-        let queued = deferredUserKeys
-        deferredUserKeys.removeAll()
+        let queued = deferredUserKeys.takeAll()
         stateLock.unlock()
         return queued
     }
@@ -1486,17 +1493,14 @@ final class KoEnFixEngine {
         // While replacing & switching input sources, hold fast follow-up keystrokes and replay
         // them once the target input language is active so the next word starts in the new language.
         if isReplacing {
-            if type == .keyDown {
-                let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-                let flags = event.flags
-                let isBareModifier = (54...63).contains(Int(keyCode))
-                if !isBareModifier &&
-                   !flags.contains(.maskCommand) &&
-                   !flags.contains(.maskControl) &&
-                   !flags.contains(.maskAlternate) {
-                    enqueueDeferredUserKey(keyCode: keyCode, isShift: flags.contains(.maskShift))
-                    return nil
-                }
+            if type == .keyDown,
+               let held = DeferredUserKey.held(
+                   keyCode: CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
+                   flags: event.flags,
+                   ctrlComboSwitchEnabled: switchToEnglishOnCtrlCombo
+               ) {
+                enqueueDeferredUserKey(held)
+                return nil
             } else if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
                 resetTracking()
             }
@@ -1837,8 +1841,8 @@ final class KoEnFixEngine {
         usleep(10_000)
         let queued = finishReplacingAndTakeDeferredKeys()
         guard !queued.isEmpty else { return }
-        for item in queued {
-            Self.postReplayedUserKey(keyCode: item.keyCode, isShift: item.isShift)
+        for key in queued {
+            Self.postReplayedUserKey(key)
         }
     }
 
@@ -1898,9 +1902,18 @@ final class KoEnFixEngine {
         }
     }
 
-    private static func postReplayedUserKey(keyCode: CGKeyCode, isShift: Bool) {
+    /// Replays a key held back during a replacement.
+    ///
+    /// A combo goes out as the same modifier + key sequence as the input-source shortcut, so
+    /// system shortcuts such as desktop switching see what a real key press looks like. It is
+    /// tagged as ours, so the tap passes it on without switching the input source again.
+    private static func postReplayedUserKey(_ key: DeferredUserKey) {
+        if key.isCombo {
+            postSymbolicHotKey(InputSourceManager.SymbolicHotKey(keyCode: key.keyCode, modifiers: key.modifiers))
+            return
+        }
         let src = CGEventSource(stateID: .hidSystemState)
-        if isShift {
+        if key.modifiers.contains(.maskShift) {
             let shiftDown = CGEvent(keyboardEventSource: src, virtualKey: 56, keyDown: true)
             let shiftFlags = shiftDown?.flags ?? [.maskShift]
             if let shiftDown {
@@ -1908,8 +1921,8 @@ final class KoEnFixEngine {
                 shiftDown.post(tap: .cghidEventTap)
                 usleep(2_000)
             }
-            if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
-               let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
+            if let down = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: true),
+               let up = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: false) {
                 down.flags = shiftFlags
                 up.flags = shiftFlags
                 down.setIntegerValueField(.eventSourceUserData, value: REPLAY_EVENT_TAG)
@@ -1925,8 +1938,8 @@ final class KoEnFixEngine {
                 usleep(2_000)
             }
         } else {
-            guard let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) else {
+            guard let down = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: false) else {
                 return
             }
             down.flags = []
