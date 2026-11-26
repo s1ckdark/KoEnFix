@@ -28,6 +28,16 @@ enum AutoConvertMode: String, CaseIterable {
     }
 }
 
+/// What KoEnFix does when a Ctrl combo arrives while a Korean input source is active.
+enum CtrlComboAction: Equatable {
+    /// A system input-source shortcut such as Ctrl+Space. The system handles it.
+    case passThrough
+    /// Leave the text alone and switch the input source to English.
+    case switchInputSource
+    /// Replace the pending English typo and switch the input source to English.
+    case convertWord(SimulationResult)
+}
+
 struct KeyStroke: Equatable {
     let keyCode: CGKeyCode
     let isShift: Bool
@@ -624,6 +634,21 @@ enum TypoDetector {
         }
 
         return false
+    }
+
+    /// Ctrl combo in Korean mode. The pending word converts when Space would convert it.
+    /// Everything else only switches the input source; manual mode never changes the text.
+    static func ctrlComboAction(
+        isInputSourceSwitchHotKey: Bool,
+        sim: SimulationResult?,
+        mode: AutoConvertMode,
+        prefixSymbol: Character?
+    ) -> CtrlComboAction {
+        if isInputSourceSwitchHotKey { return .passThrough }
+        guard let sim, shouldAutoConvertKoToEn(sim: sim, mode: mode, prefixSymbol: prefixSymbol) else {
+            return .switchInputSource
+        }
+        return .convertWord(sim)
     }
 
     /// Shift+Space Korean → English. A finished composition (every scalar in
@@ -2378,6 +2403,60 @@ func runSelfTests() -> Int32 {
 
         expect(InputSourceManager.isKoreanSourceID("com.apple.inputmethod.Korean.2SetKorean"), "2SetKorean is recognized as Korean")
         expect(!InputSourceManager.isKoreanSourceID("com.apple.keylayout.ABC"), "ABC is recognized as non-Korean")
+    }
+
+    // 7. Ctrl combo in Korean mode converts the pending word when Space would, else only switches.
+    do {
+        func simulated(_ en: String) -> SimulationResult {
+            HangulAutomata.simulate(HangulAutomata.strokes(fromEnglish: en)!)
+        }
+        func action(
+            _ en: String,
+            hotKey: Bool = false,
+            mode: AutoConvertMode = .conservative,
+            prefix: Character? = nil
+        ) -> CtrlComboAction {
+            TypoDetector.ctrlComboAction(
+                isInputSourceSwitchHotKey: hotKey,
+                sim: simulated(en),
+                mode: mode,
+                prefixSymbol: prefix
+            )
+        }
+        for (en, ko) in [("ls", "ㅣㄴ"), ("tmux", "스ㅕㅌ"), ("git", "햣")] {
+            expect(
+                action(en) == .convertWord(simulated(en)),
+                "Ctrl combo after the English typo '\(ko)' converts it to '\(en)'"
+            )
+            expect(
+                action(en, mode: .aggressive) == .convertWord(simulated(en)),
+                "Aggressive mode also converts '\(ko)' on a Ctrl combo"
+            )
+            expect(
+                action(en, mode: .manualOnly) == .switchInputSource,
+                "Manual mode leaves '\(ko)' as typed and only switches the input source"
+            )
+        }
+        expect(
+            action("q", prefix: ":") == .convertWord(simulated("q")),
+            "Ctrl combo after ':ㅂ' converts the Vim command 'q'"
+        )
+        for (en, ko) in [("dkssud", "안녕"), ("go", "해")] {
+            expect(
+                action(en) == .switchInputSource,
+                "Ctrl combo after the real Korean word '\(ko)' only switches the input source"
+            )
+        }
+        expect(
+            TypoDetector.ctrlComboAction(
+                isInputSourceSwitchHotKey: false, sim: nil, mode: .conservative, prefixSymbol: nil
+            ) == .switchInputSource,
+            "Ctrl combo with no pending word only switches the input source"
+        )
+        expect(
+            action("ls", hotKey: true) == .passThrough,
+            "Ctrl+Space stays with the system input-source shortcut"
+        )
     }
 
     if failures == 0 {
