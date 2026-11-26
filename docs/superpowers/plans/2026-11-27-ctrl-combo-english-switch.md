@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-27-ctrl-combo-english-switch-design.md`
 
+## Changes after the first code review
+
+An independent review of the code commits `0074ced`..`0267f14` found no critical issue and three important ones. The tasks below are the plan as executed. These later commits changed the result, and the spec describes the final state:
+
+- `9cbcf77`: the key events of a replayed combo carry only the combo's own modifiers, through `InputSourceManager.droppingModifiers(in:except:)` and `postSymbolicHotKey(_:excludingHeldModifiers:)`. So Task 4's text for `postReplayedUserKey` and Task 7's "j or g" follow-up are out of date; see the follow-up section.
+- `19bad4d`: `holdKeyWhileReplacing` checks and enqueues under one lock hold, and `beginReplacing(replayAfter:)` queues the trigger while it clears the queue. Task 4's replacing branch, `enqueueDeferredUserKey` (since removed) and the two `replayAfter` loops in Task 5 are out of date.
+- `1fc1585`: tests for Ctrl+Shift, Ctrl+Opt and Ctrl+Cmd combos and for the `-` prefix.
+- The manual checklist in Task 7 gained rows k and l, and row g now uses two different shortcuts so that order is observable.
+
 ## Global Constraints
 
 - Everything lives in `Sources/KoEnFix.swift`. The install script compiles that one file; no file splits, no new dependencies.
@@ -851,10 +860,12 @@ These need a real keyboard and IME session, so only the user can run them. They 
 | d | tmux, 한글 모드: Ctrl+B 뒤에 `d` | 영문 모드라 `d`가 그대로 전달되어 detach |
 | e | 한글 모드: Ctrl+Space | 시스템 토글만 동작. 한 번만 바뀜 |
 | f | 영문 모드: Ctrl+P | 아무 변화 없음 |
-| g | Ctrl를 누른 채 Ctrl+W, Ctrl+S 연속 | 순서대로 두 번 전달 |
+| g | Terminal, 한글 모드: `abc`를 치고 Ctrl를 누른 채 Ctrl+A, Ctrl+E | 커서가 `abc` 뒤에 있음. 순서가 뒤바뀌면 앞에 놓임 |
 | h | 한글 모드: `안녕` + Ctrl+S | `안녕` 유지, 영문 모드 |
 | i | 한글 모드: `안녕하`(`하` 조합 중) + Ctrl+S | `안녕하` 유지, 영문 모드 |
 | j | 한글 모드: Ctrl+2 | 영문 모드, 2번 데스크톱으로 이동 |
+| k | VS Code, 한글 모드: Ctrl+P 직후 바로 Shift+글자 | Quick Open이 열림. 명령 팔레트(Ctrl+Shift+P)가 아니어야 함 |
+| l | 한글 모드: `ㅣㄴ` + Space 직후 바로 Ctrl+Space | 변환은 `ls `로 끝나고, Ctrl+Space는 그 뒤에 한 번 전달되어 한글 모드로 바뀜 |
 
 If a check fails, the user turns the menu toggle off (that restores the old behavior exactly) and reports the row. The follow-ups are below.
 
@@ -878,10 +889,7 @@ The IME dropped the marked text on deactivation. Commit it by hand instead: unwi
         replayAfter: [DeferredUserKey] = [],
         recordsConversion: Bool = true
     ) {
-        beginReplacing()
-        for key in replayAfter {
-            enqueueDeferredUserKey(key)
-        }
+        beginReplacing(replayAfter: replayAfter)
         if recordsConversion {
             recordConversion(from: fromLabel, to: toLabel)
         }
@@ -911,7 +919,7 @@ Then in `handleCtrlCombo`, capture the pending snapshot and take this path befor
 
 ### j or g fails: system shortcuts do not fire, or combos typed while Ctrl is held go wrong
 
-Drop the modifier press and release. Replace the first three lines of `postReplayedUserKey`'s body with a bare modified key pair:
+Drop the modifier press and release. Replace the `postSymbolicHotKey(...)` call inside the `if key.isCombo {` branch of `postReplayedUserKey` with a bare modified key pair. Its flags are explicit, so no modifier the user is holding can ride along:
 
 ```swift
         if key.isCombo {
