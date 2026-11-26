@@ -95,7 +95,7 @@ static func ctrlComboAction(
 
 - 대기열 항목을 `(keyCode, isShift)`에서 `DeferredUserKey { keyCode, modifiers }`로 바꾼다. `modifiers`는 Shift, Ctrl, Opt, Cmd만 담는다.
 - 대기열 본체를 `DeferredKeyQueue` 순수 타입으로 분리하고 엔진이 락 안에서만 쓴다.
-- 교체·전환 중(`isReplacing`)에 `keyDown`이 들어오면 `deferredKey(keyDown:flags:ctrlComboSwitchEnabled:)` 순수 함수가 정한다. `nil`이면 즉시 통과이다.
+- 교체·전환 중(`isReplacing`)에 `keyDown`이 들어오면 `DeferredUserKey.held(keyCode:flags:ctrlComboSwitchEnabled:)` 순수 함수가 정한다. `nil`이면 즉시 통과이다.
 
 | 교체 중 들어온 키 | 기능 켬 | 기능 끔 |
 |---|---|---|
@@ -114,9 +114,11 @@ Ctrl 조합을 대기열에 넣는 이유는 트리거보다 먼저 앱에 도�
 
 ### 4. 재생 이벤트
 
-- Ctrl, Cmd, Opt 중 하나라도 가진 항목: 원래 이벤트의 Shift, Ctrl, Opt, Cmd 플래그를 그대로 붙인 `keyDown`과 `keyUp` 한 쌍을 보내고 `SELF_EVENT_TAG`를 건다. 탭이 이 태그를 무조건 통과시키므로 전환이 실패해도 다시 트리거되지 않는다.
-- 수정자 키 자체의 눌림과 떼림은 합성하지 않는다. 사용자가 Ctrl를 아직 누르고 있을 때 합성 Ctrl 떼림이 들어가면 앱이 아는 수정자 상태가 실제와 어긋날 수 있기 때문이다.
+- Ctrl, Cmd, Opt 중 하나라도 가진 항목: 입력기 전환 단축키에 이미 쓰이는 `postSymbolicHotKey`와 같은 순서로 합성한다. 수정자 눌림, 원래 이벤트의 Shift, Ctrl, Opt, Cmd 플래그를 가진 `keyDown`과 `keyUp`, 수정자 뗌 순서다. 실제 키 입력과 같은 형태라서 데스크톱 전환처럼 시스템이 처리하는 단축키도 그대로 받는다. 이벤트에 `SELF_EVENT_TAG`를 달아 탭이 무조건 통과시키므로 전환이 실패해도 다시 트리거되지 않는다.
+- **비용**: 사용자가 Ctrl를 아직 누르고 있을 때는 합성한 Ctrl 뗌이 실제 뗌보다 먼저 들어간다. 그동안 앱이 아는 수정자 상태가 키보드와 어긋날 수 있다. 다만 다음 물리 키 이벤트는 하드웨어 상태의 플래그를 그대로 가지고 들어오므로 이후 조합에는 영향이 없다. 기존의 Shift+키 재생이 같은 방식으로 동작하고 있다.
 - 일반 키와 Shift+키는 기존 `postReplayedUserKey` 동작을 그대로 쓴다.
+
+2026-11-27 수정: 처음에는 수정자 눌림과 뗌 없이 키 한 쌍에 플래그만 붙이는 방식을 기본으로 했다. 구현 시점에 화면이 잠겨 있어 자동 검증을 할 수 없었고, 시스템 단축키가 받아들일 가능성이 높은 쪽을 기본으로 바꿨다.
 
 ### 5. 설정과 메뉴
 
@@ -137,7 +139,7 @@ Ctrl 조합을 대기열에 넣는 이유는 트리거보다 먼저 앱에 도�
 
 1. **판정표** (`ctrlComboAction`): 영문 오타(`ㅣㄴ`, `스ㅕㅌ`, `:ㅂ`) → `convertWord`. 진짜 한글(`안녕`, `해`)과 빈 버퍼 → `switchInputSource`. 수동 모드 + `ㅣㄴ` → `switchInputSource`. 시스템 단축키 → `passThrough`.
 2. **단축키 매칭** (`matchesInputSourceSwitchHotKey`): 60(Ctrl+Space)과 61(Ctrl+Opt+Space)은 일치. 꺼진 항목은 무시. 다른 키나 다른 수정자는 불일치.
-3. **대기열** (`deferredKey`, `DeferredKeyQueue`): 위 표의 모든 칸. 들어온 순서대로 나온다. 16개 상한을 지킨다.
+3. **대기열** (`DeferredUserKey.held`, `DeferredKeyQueue`): 위 표의 모든 칸. 들어온 순서대로 나온다. 16개 상한을 지킨다.
 
 수동 확인은 IME와 포커스 동작이 섞여 있어 유닛 테스트로 불가능하다. 구현 첫 단계에서 재생 방식 검증을 겸해 아래 표를 수행한다.
 
@@ -154,4 +156,4 @@ Ctrl 조합을 대기열에 넣는 이유는 트리거보다 먼저 앱에 도�
 | i | 한글 모드: `안녕하`(`하` 조합 중) + Ctrl+S | `안녕하` 유지, 영문 모드 |
 | j | 한글 모드: Ctrl+2 | 영문 모드, 2번 데스크톱으로 이동 |
 
-j에서 시스템 단축키가 재생되지 않으면 그 경로만 `postSymbolicHotKey`처럼 수정자 눌림과 떼림을 함께 합성하는 방식으로 바꾼다.
+j에서 데스크톱 전환이 되지 않으면 수정자 눌림과 뗌 없이 키 한 쌍에 플래그만 붙이는 방식으로 바꾼다. g에서 Ctrl를 누른 채 누른 다음 조합이 제대로 전달되지 않아도 같은 방식으로 바꾼다.
