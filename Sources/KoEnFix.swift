@@ -1363,21 +1363,31 @@ final class KoEnFixEngine {
         learnedList = LearnedEnToKoList.loadFromDefaults()
     }
 
-    private func beginReplacing() {
+    /// Starts a replacement. `replayAfter` is queued first, so a combo the tap swallowed on
+    /// purpose is delivered before any key typed after it.
+    fileprivate func beginReplacing(replayAfter: [DeferredUserKey] = []) {
         stateLock.lock()
         isReplacingStorage = true
         deferredUserKeys.removeAll()
+        for key in replayAfter {
+            deferredUserKeys.enqueue(key)
+        }
         ignoreSourceChangeNotificationsUntil = ProcessInfo.processInfo.systemUptime + 0.6
         stateLock.unlock()
     }
 
-    private func enqueueDeferredUserKey(_ key: DeferredUserKey) {
+    /// Holds a keystroke while a replacement runs, and returns true so the event is swallowed.
+    /// False when no replacement is running. The check and the enqueue share one lock hold, so a
+    /// key cannot land in the queue after the worker has drained it.
+    fileprivate func holdKeyWhileReplacing(_ key: DeferredUserKey) -> Bool {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard isReplacingStorage else { return false }
         deferredUserKeys.enqueue(key)
-        stateLock.unlock()
+        return true
     }
 
-    private func finishReplacingAndTakeDeferredKeys() -> [DeferredUserKey] {
+    fileprivate func finishReplacingAndTakeDeferredKeys() -> [DeferredUserKey] {
         stateLock.lock()
         isReplacingStorage = false
         ignoreSourceChangeNotificationsUntil = ProcessInfo.processInfo.systemUptime + 0.35
@@ -1511,16 +1521,19 @@ final class KoEnFixEngine {
 
         // While replacing & switching input sources, hold fast follow-up keystrokes and replay
         // them once the target input language is active so the next word starts in the new language.
+        // The hold checks and enqueues under one lock hold: a key must not land in the queue after
+        // the worker drained it.
+        if type == .keyDown,
+           let held = DeferredUserKey.held(
+               keyCode: CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
+               flags: event.flags,
+               ctrlComboSwitchEnabled: switchToEnglishOnCtrlCombo
+           ),
+           holdKeyWhileReplacing(held) {
+            return nil
+        }
         if isReplacing {
-            if type == .keyDown,
-               let held = DeferredUserKey.held(
-                   keyCode: CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
-                   flags: event.flags,
-                   ctrlComboSwitchEnabled: switchToEnglishOnCtrlCombo
-               ) {
-                enqueueDeferredUserKey(held)
-                return nil
-            } else if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
+            if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
                 resetTracking()
             }
             return Unmanaged.passRetained(event)
@@ -1846,10 +1859,7 @@ final class KoEnFixEngine {
     ///   2) Inject composed Korean Unicode text while STILL in `ABC` mode (bypasses KoreanIM composition!)
     ///   3) Switch input source to Korean (`2SetKorean`)
     private func performInputSourceToggle(currentlyKorean: Bool, replayAfter: [DeferredUserKey] = []) {
-        beginReplacing()
-        for key in replayAfter {
-            enqueueDeferredUserKey(key)
-        }
+        beginReplacing(replayAfter: replayAfter)
         workerQueue.async { [weak self] in
             if currentlyKorean {
                 InputSourceManager.activateEnglishFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
@@ -1868,10 +1878,7 @@ final class KoEnFixEngine {
         toLabel: String,
         replayAfter: [DeferredUserKey] = []
     ) {
-        beginReplacing()
-        for key in replayAfter {
-            enqueueDeferredUserKey(key)
-        }
+        beginReplacing(replayAfter: replayAfter)
         recordConversion(from: fromLabel, to: toLabel)
 
         workerQueue.async { [weak self] in
@@ -2773,6 +2780,28 @@ func runSelfTests() -> Int32 {
         queue.enqueue(DeferredUserKey(keyCode: 5, modifiers: []))
         let taken = queue.takeAll()
         expect(taken.map { $0.keyCode } == [5] && queue.keys.isEmpty, "takeAll hands over everything once")
+    }
+
+    // 10. The engine holds keys across a replacement and replays the triggering combo first.
+    do {
+        let engine = KoEnFixEngine.shared
+        let combo = DeferredUserKey(keyCode: 32, modifiers: [.maskControl])
+        let typed = DeferredUserKey(keyCode: 2, modifiers: [])
+        let shifted = DeferredUserKey(keyCode: 5, modifiers: [.maskShift])
+
+        expect(!engine.holdKeyWhileReplacing(typed), "Outside a replacement no key is held")
+
+        engine.beginReplacing(replayAfter: [combo])
+        expect(engine.holdKeyWhileReplacing(typed), "A key typed during a replacement is held")
+        expect(engine.holdKeyWhileReplacing(shifted), "A Shift+key typed during a replacement is held")
+        expect(
+            engine.finishReplacingAndTakeDeferredKeys() == [combo, typed, shifted],
+            "The triggering combo is replayed first, then the later keys in press order"
+        )
+
+        expect(!engine.holdKeyWhileReplacing(typed), "Once the replacement ends no key is held")
+        engine.beginReplacing()
+        expect(engine.finishReplacingAndTakeDeferredKeys().isEmpty, "A replacement without a trigger replays nothing")
     }
 
     if failures == 0 {
