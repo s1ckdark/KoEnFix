@@ -2222,6 +2222,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termEnterItem.state = engine.convertOnTerminalEnter ? .on : .off
         menu.addItem(termEnterItem)
 
+        let ctrlComboItem = NSMenuItem(
+            title: "Ctrl 조합키 입력 시 한글 → 영문 전환",
+            action: #selector(toggleCtrlComboSwitch),
+            keyEquivalent: ""
+        )
+        ctrlComboItem.target = self
+        ctrlComboItem.state = engine.switchToEnglishOnCtrlCombo ? .on : .off
+        menu.addItem(ctrlComboItem)
+
         menu.addItem(NSMenuItem.separator())
 
         appendLearnedMenu(menu, title: "Space로 바꿀 영문", words: engine.learnedList.accept)
@@ -2297,6 +2306,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleTerminalEnter() {
         KoEnFixEngine.shared.convertOnTerminalEnter.toggle()
+    }
+
+    @objc private func toggleCtrlComboSwitch() {
+        KoEnFixEngine.shared.switchToEnglishOnCtrlCombo.toggle()
     }
 
     @objc private func openAccessibilitySettings() {
