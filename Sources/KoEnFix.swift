@@ -906,6 +906,34 @@ enum InputSourceManager {
         return SymbolicHotKey(keyCode: CGKeyCode(rawKeyCode), modifiers: modifiers)
     }
 
+    /// The Shift/Ctrl/Opt/Cmd part of event flags. Device-dependent bits are dropped.
+    static func shortcutModifiers(of flags: CGEventFlags) -> CGEventFlags {
+        return flags.intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
+    }
+
+    /// "Select the previous input source" (60) and "Select next source in Input menu" (61).
+    static func inputSourceSwitchHotKeys(from hotKeys: [String: Any]) -> [SymbolicHotKey] {
+        return ["60", "61"].compactMap { parseSymbolicHotKey(from: hotKeys, id: $0) }
+    }
+
+    static func inputSourceSwitchHotKeys() -> [SymbolicHotKey] {
+        guard let domain = UserDefaults.standard.persistentDomain(forName: "com.apple.symbolichotkeys"),
+              let hotKeys = domain["AppleSymbolicHotKeys"] as? [String: Any] else {
+            return []
+        }
+        return inputSourceSwitchHotKeys(from: hotKeys)
+    }
+
+    /// True when the key and its Shift/Ctrl/Opt/Cmd modifiers equal one of `hotKeys`.
+    static func matchesInputSourceSwitchHotKey(
+        keyCode: CGKeyCode,
+        modifiers: CGEventFlags,
+        hotKeys: [SymbolicHotKey]
+    ) -> Bool {
+        let modifiers = shortcutModifiers(of: modifiers)
+        return hotKeys.contains { $0.keyCode == keyCode && $0.modifiers == modifiers }
+    }
+
     static func previousInputSourceHotKey() -> SymbolicHotKey? {
         guard let domain = UserDefaults.standard.persistentDomain(forName: "com.apple.symbolichotkeys"),
               let hotKeys = domain["AppleSymbolicHotKeys"] as? [String: Any] else {
@@ -2456,6 +2484,61 @@ func runSelfTests() -> Int32 {
         expect(
             action("ls", hotKey: true) == .passThrough,
             "Ctrl+Space stays with the system input-source shortcut"
+        )
+    }
+
+    // 8. Only the system's own input-source shortcuts (60, 61) are left to the system.
+    do {
+        let hotKeys: [String: Any] = [
+            "60": [
+                "enabled": true,
+                "value": [
+                    "parameters": [32, 49, 262144],
+                    "type": "standard"
+                ]
+            ],
+            "61": [
+                "enabled": true,
+                "value": [
+                    "parameters": [32, 49, 786432],
+                    "type": "standard"
+                ]
+            ],
+            "118": [
+                "enabled": true,
+                "value": [
+                    "parameters": [65535, 18, 262144],
+                    "type": "standard"
+                ]
+            ]
+        ]
+        let switchHotKeys = InputSourceManager.inputSourceSwitchHotKeys(from: hotKeys)
+        expect(switchHotKeys.count == 2, "Shortcuts 60 and 61 are the input-source shortcuts; 118 is not")
+        expect(
+            InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 49, modifiers: [.maskControl], hotKeys: switchHotKeys),
+            "Ctrl+Space matches shortcut 60"
+        )
+        expect(
+            InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 49, modifiers: [.maskControl, .maskAlternate], hotKeys: switchHotKeys),
+            "Ctrl+Opt+Space matches shortcut 61"
+        )
+        expect(
+            !InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 49, modifiers: [.maskControl, .maskShift], hotKeys: switchHotKeys),
+            "Ctrl+Shift+Space is not an input-source shortcut"
+        )
+        expect(
+            !InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 18, modifiers: [.maskControl], hotKeys: switchHotKeys),
+            "Ctrl+1 is not an input-source shortcut"
+        )
+        expect(
+            InputSourceManager.inputSourceSwitchHotKeys(from: ["61": ["enabled": false]]).isEmpty,
+            "A disabled shortcut is ignored"
+        )
+        let physicalCtrl = InputSourceManager.convertCarbonModifiersToCGFlags(262144)
+            .union(CGEventFlags(rawValue: 0x0101))
+        expect(
+            InputSourceManager.shortcutModifiers(of: physicalCtrl) == [.maskControl],
+            "Device-dependent modifier bits are dropped"
         )
     }
 
