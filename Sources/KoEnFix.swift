@@ -2646,6 +2646,10 @@ func runSelfTests() -> Int32 {
             action("q", prefix: ":") == .convertWord(simulated("q")),
             "Ctrl combo after ':ㅂ' converts the Vim command 'q'"
         )
+        expect(
+            action("la", prefix: "-") == .convertWord(simulated("la")),
+            "Ctrl combo after '-ㅣㅁ' converts the CLI flag 'la'"
+        )
         for (en, ko) in [("dkssud", "안녕"), ("go", "해")] {
             expect(
                 action(en) == .switchInputSource,
@@ -2757,6 +2761,21 @@ func runSelfTests() -> Int32 {
             DeferredUserKey.held(keyCode: 32, flags: ctrl, ctrlComboSwitchEnabled: false) == nil,
             "With the switch off, a Ctrl combo passes straight through"
         )
+        let shift = InputSourceManager.convertCarbonModifiersToCGFlags(131072)
+        for (name, extra) in [("Shift", shift), ("Opt", opt), ("Cmd", cmd)] {
+            expect(
+                DeferredUserKey.held(
+                    keyCode: 44,
+                    flags: ctrl.union(extra).union(CGEventFlags(rawValue: 0x0009)),
+                    ctrlComboSwitchEnabled: true
+                ) == DeferredUserKey(keyCode: 44, modifiers: CGEventFlags.maskControl.union(extra)),
+                "Ctrl+\(name)+key waits with both modifiers kept and device bits dropped"
+            )
+            expect(
+                DeferredUserKey.held(keyCode: 44, flags: ctrl.union(extra), ctrlComboSwitchEnabled: false) == nil,
+                "With the switch off, Ctrl+\(name)+key passes straight through"
+            )
+        }
         expect(DeferredUserKey.held(keyCode: 8, flags: cmd, ctrlComboSwitchEnabled: true) == nil, "A Cmd shortcut is never held")
         expect(DeferredUserKey.held(keyCode: 8, flags: opt, ctrlComboSwitchEnabled: true) == nil, "An Opt shortcut is never held")
         expect(DeferredUserKey.held(keyCode: 59, flags: ctrl, ctrlComboSwitchEnabled: true) == nil, "A modifier key is never held")
