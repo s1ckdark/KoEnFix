@@ -14,7 +14,8 @@
 
 An independent review of the code commits `0074ced`..`0267f14` found no critical issue and three important ones. The tasks below are the plan as executed. These later commits changed the result, and the spec describes the final state:
 
-- `9cbcf77`: the key events of a replayed combo carry only the combo's own modifiers, through `InputSourceManager.droppingModifiers(in:except:)` and `postSymbolicHotKey(_:excludingHeldModifiers:)`. So Task 4's text for `postReplayedUserKey` and Task 7's "j or g" follow-up are out of date; see the follow-up section.
+- `9cbcf77`: the key events of a replayed combo carry only the combo's own modifiers, through `postSymbolicHotKey(_:excludingHeldModifiers:)`. So Task 4's text for `postReplayedUserKey` and Task 7's "j or g" follow-up are out of date; see the follow-up section. The helper it introduced was replaced in `cf8b6d8`.
+- `cf8b6d8` (after a second review of the fixes above, which found no Critical or Important issue): a held key keeps Fn (`InputSourceManager.keyStrokeModifiers(of:)`), so Ctrl+Fn+Left is not replayed as Ctrl+Left. The replayed key's flags come from `InputSourceManager.keyStrokeFlags(from:modifiers:)`: the combo's own modifiers are always present, foreign modifiers and a foreign Fn are dropped. Task 3's `DeferredUserKey` doc comment is out of date.
 - `19bad4d`: `holdKeyWhileReplacing` checks and enqueues under one lock hold, and `beginReplacing(replayAfter:)` queues the trigger while it clears the queue. Task 4's replacing branch, `enqueueDeferredUserKey` (since removed) and the two `replayAfter` loops in Task 5 are out of date.
 - `1fc1585`: tests for Ctrl+Shift, Ctrl+Opt and Ctrl+Cmd combos and for the `-` prefix.
 - The manual checklist in Task 7 gained rows k and l, and row g now uses two different shortcuts so that order is observable.
@@ -866,8 +867,13 @@ These need a real keyboard and IME session, so only the user can run them. They 
 | j | 한글 모드: Ctrl+2 | 영문 모드, 2번 데스크톱으로 이동 |
 | k | VS Code, 한글 모드: Ctrl+P 직후 바로 Shift+글자 | Quick Open이 열림. 명령 팔레트(Ctrl+Shift+P)가 아니어야 함 |
 | l | 한글 모드: `ㅣㄴ` + Space 직후 바로 Ctrl+Space | 변환은 `ls `로 끝나고, Ctrl+Space는 그 뒤에 한 번 전달되어 한글 모드로 바뀜 |
+| m | Terminal, 한글 모드: Ctrl+Fn+← | 커서가 줄 시작으로 이동(Ctrl+Home). 단어 단위 이동(Ctrl+←)으로 바뀌지 않아야 함 |
 
 If a check fails, the user turns the menu toggle off (that restores the old behavior exactly) and reports the row. The follow-ups are below.
+
+### Known limit left as is
+
+A key typed in the 4–5 ms after a replacement ends, while the replayed trigger is still being posted, passes straight through and can reach the app before the trigger. Each further queued key widens the window. The window existed before this feature for deferred plain keys. Fix only if the user sees it: keep `isReplacingStorage` true during the replay, drain the queue again afterwards, and let `REPLAY_EVENT_TAG` events bypass `holdKeyWhileReplacing`.
 
 ---
 

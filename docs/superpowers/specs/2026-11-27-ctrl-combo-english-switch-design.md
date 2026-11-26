@@ -85,7 +85,8 @@ static func ctrlComboAction(
 ### 2. 시스템 단축키 매칭 (`InputSourceManager`)
 
 - `inputSourceSwitchHotKeys()`: `com.apple.symbolichotkeys`에서 60("이전 입력 소스 선택")과 61("입력 메뉴에서 다음 소스 선택") 중 켜진 항목을 `SymbolicHotKey`로 반환한다. 기존 `parseSymbolicHotKey(from:id:)`를 재사용한다.
-- `shortcutModifiers(of:)`: 이벤트 플래그에서 Shift, Ctrl, Opt, Cmd만 남긴다.
+- `shortcutModifiers(of:)`: 이벤트 플래그에서 Shift, Ctrl, Opt, Cmd만 남긴다. 단축키 매칭에 쓴다.
+- `keyStrokeModifiers(of:)`: 재생할 키가 가질 수정자다. 네 가지에 Fn을 더한 것이다. 방향키가 Home, End, PageUp, PageDown으로 남으려면 Fn이 필요하다.
 - `matchesInputSourceSwitchHotKey(keyCode:modifiers:hotKeys:)`: 순수 함수. 키코드와 수정자 네 종이 모두 같아야 일치한다.
 - 엔진은 한글 모드의 Ctrl 조합키에서만 설정을 읽는다.
 
@@ -95,7 +96,7 @@ static func ctrlComboAction(
 
 ### 3. 지연 재생 대기열
 
-- 대기열 항목을 `(keyCode, isShift)`에서 `DeferredUserKey { keyCode, modifiers }`로 바꾼다. `modifiers`는 Shift, Ctrl, Opt, Cmd만 담는다.
+- 대기열 항목을 `(keyCode, isShift)`에서 `DeferredUserKey { keyCode, modifiers }`로 바꾼다. `modifiers`는 `keyStrokeModifiers(of:)`가 고른다. 장치 비트는 버리고 Fn은 남긴다.
 - 대기열 본체를 `DeferredKeyQueue` 순수 타입으로 분리하고 엔진이 락 안에서만 쓴다.
 - 교체·전환 중(`isReplacing`)에 `keyDown`이 들어오면 `DeferredUserKey.held(keyCode:flags:ctrlComboSwitchEnabled:)` 순수 함수가 정한다. `nil`이면 즉시 통과이다.
 
@@ -117,9 +118,10 @@ Ctrl 조합을 대기열에 넣는 이유는 트리거보다 먼저 앱에 도�
 
 ### 4. 재생 이벤트
 
-- Ctrl, Cmd, Opt 중 하나라도 가진 항목: 입력기 전환 단축키에 이미 쓰이는 `postSymbolicHotKey`와 같은 순서로 합성한다. 수정자 눌림, 원래 이벤트의 Shift, Ctrl, Opt, Cmd 플래그를 가진 `keyDown`과 `keyUp`, 수정자 뗌 순서다. 실제 키 입력과 같은 형태라서 데스크톱 전환처럼 시스템이 처리하는 단축키도 그대로 받는다. 이벤트에 `SELF_EVENT_TAG`를 달아 탭이 무조건 통과시키므로 전환이 실패해도 다시 트리거되지 않는다.
+- Ctrl, Cmd, Opt 중 하나라도 가진 항목: 입력기 전환 단축키에 이미 쓰이는 `postSymbolicHotKey`와 같은 순서로 합성한다. 수정자 눌림, 원래 이벤트의 수정자 플래그를 가진 `keyDown`과 `keyUp`, 수정자 뗌 순서다. 실제 키 입력과 같은 형태라서 데스크톱 전환처럼 시스템이 처리하는 단축키도 그대로 받는다. 이벤트에 `SELF_EVENT_TAG`를 달아 탭이 무조건 통과시키므로 전환이 실패해도 다시 트리거되지 않는다.
 - **비용**: 사용자가 Ctrl를 아직 누르고 있을 때는 합성한 Ctrl 뗌이 실제 뗌보다 먼저 들어간다. 그동안 앱이 아는 수정자 상태가 키보드와 어긋날 수 있다. 다만 다음 물리 키 이벤트는 하드웨어 상태의 플래그를 그대로 가지고 들어오므로 이후 조합에는 영향이 없다. 기존의 Shift+키 재생이 같은 방식으로 동작하고 있다.
-- **조합 자체의 수정자만 담는다**: 이 시퀀스의 플래그는 하드웨어 상태에서 만들어지므로, 재생 순간에 사용자가 누르고 있던 다른 수정자가 따라 붙을 수 있다. Ctrl+P를 누른 직후 Shift를 누르면 Ctrl+Shift+P로 나가는 식이다. 재생 경로에서는 `keyDown`과 `keyUp`이 `InputSourceManager.droppingModifiers(in:except:)`로 조합의 수정자만 남긴다. 수정자 키 이벤트는 키보드의 실제 상태를 그대로 알리고, 입력기 전환 단축키 경로는 기존 플래그를 그대로 쓴다.
+- **조합 자체의 수정자만 담는다**: 이 시퀀스의 플래그는 하드웨어 상태에서 만들어지므로, 재생 순간에 사용자가 누르고 있던 다른 수정자가 따라 붙을 수 있다. Ctrl+P를 누른 직후 Shift를 누르면 Ctrl+Shift+P로 나가는 식이다. 재생 경로에서는 `keyDown`과 `keyUp`이 `InputSourceManager.keyStrokeFlags(from:modifiers:)`로 조합의 수정자만 담는다. 조합의 수정자는 사용자가 이미 뗐더라도 붙고, 그때 누르고 있던 다른 수정자와 Fn은 빠진다. 수정자 키 이벤트는 키보드의 실제 상태를 그대로 알리고, 입력기 전환 단축키 경로는 기존 플래그를 그대로 쓴다.
+- **Fn은 보존한다**: Ctrl+Fn+← 는 Ctrl+Home 이라서 Fn을 버리면 다른 키가 된다. 단축키 매칭에는 네 가지만 쓰지만, 재생할 키에는 Fn을 그대로 싣는다.
 - 일반 키와 Shift+키는 기존 `postReplayedUserKey` 동작을 그대로 쓴다.
 
 2026-11-27 수정: 처음에는 수정자 눌림과 뗌 없이 키 한 쌍에 플래그만 붙이는 방식을 기본으로 했다. 구현 시점에 화면이 잠겨 있어 자동 검증을 할 수 없었고, 시스템 단축키가 받아들일 가능성이 높은 쪽을 기본으로 바꿨다.
@@ -142,7 +144,7 @@ Ctrl 조합을 대기열에 넣는 이유는 트리거보다 먼저 앱에 도�
 셀프 테스트(`--self-test`)에 추가한다. 1~4번은 순수 함수와 락으로 보호된 엔진 상태만 다룬다.
 
 1. **판정표** (`ctrlComboAction`): 영문 오타(`ㅣㄴ`, `스ㅕㅌ`, `:ㅂ`, `-ㅣㅁ`) → `convertWord`. 진짜 한글(`안녕`, `해`)과 빈 버퍼 → `switchInputSource`. 수동 모드 + `ㅣㄴ` → `switchInputSource`. 시스템 단축키 → `passThrough`.
-2. **단축키 매칭** (`matchesInputSourceSwitchHotKey`, `droppingModifiers`): 60(Ctrl+Space)과 61(Ctrl+Opt+Space)은 일치. 꺼진 항목은 무시. 다른 키나 다른 수정자는 불일치. 조합에 없는 수정자는 일반 비트와 장치 비트 모두 빠지고, 조합에 있는 수정자는 남는다.
+2. **단축키 매칭과 재생 플래그** (`matchesInputSourceSwitchHotKey`, `keyStrokeFlags`, `keyStrokeModifiers`): 60(Ctrl+Space)과 61(Ctrl+Opt+Space)은 일치. 꺼진 항목은 무시. 다른 키나 다른 수정자는 불일치. 재생 플래그에서 조합에 없는 수정자는 일반 비트와 장치 비트 모두 빠지고, 조합에 있는 수정자는 남는다. 조합의 Fn은 사용자가 뗀 뒤에도 붙고, 그때 누른 Fn은 빠진다.
 3. **대기열** (`DeferredUserKey.held`, `DeferredKeyQueue`): 위 표의 모든 칸. Ctrl+Shift, Ctrl+Opt, Ctrl+Cmd는 수정자 둘 다 가진 채 대기한다. 들어온 순서대로 나온다. 16개 상한을 지킨다.
 4. **엔진 대기열** (`beginReplacing`, `holdKeyWhileReplacing`, `finishReplacingAndTakeDeferredKeys`): 교체 중이 아닐 때는 아무 키도 대기하지 않는다. 교체 중에는 트리거가 첫 항목이고 그다음 키들은 누른 순서대로 나온다. 교체가 끝나면 다시 대기하지 않는다.
 
@@ -162,6 +164,7 @@ Ctrl 조합을 대기열에 넣는 이유는 트리거보다 먼저 앱에 도�
 | j | 한글 모드: Ctrl+2 | 영문 모드, 2번 데스크톱으로 이동 |
 | k | VS Code, 한글 모드: Ctrl+P 직후 바로 Shift+글자 | Quick Open이 열림. 명령 팔레트(Ctrl+Shift+P)가 아니어야 함 |
 | l | 한글 모드: `ㅣㄴ` + Space 직후 바로 Ctrl+Space | 변환은 `ls `로 끝나고, Ctrl+Space는 그 뒤에 한 번 전달되어 한글 모드로 바뀜 |
+| m | Terminal, 한글 모드: Ctrl+Fn+← | 커서가 줄 시작으로 이동(Ctrl+Home). 단어 단위 이동(Ctrl+←)으로 바뀌지 않아야 함 |
 
 j에서 데스크톱 전환이 되지 않으면 수정자 눌림과 뗌 없이 키 한 쌍에 플래그만 붙이는 방식으로 바꾼다. g에서 Ctrl를 누른 채 누른 다음 조합이 제대로 전달되지 않아도 같은 방식으로 바꾼다.
 
