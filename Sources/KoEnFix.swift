@@ -1525,6 +1525,11 @@ final class KoEnFixEngine {
         let hasOpt = flags.contains(.maskAlternate)
         let hasShift = flags.contains(.maskShift)
 
+        // Ctrl combo in Korean mode: switch to English first, then deliver the combo to the app
+        if hasCtrl && !isModifierKeyCode(keyCode) && switchToEnglishOnCtrlCombo && InputSourceManager.isKoreanActive() {
+            return handleCtrlCombo(keyCode: keyCode, flags: flags, originalEvent: event)
+        }
+
         // Any Cmd / Ctrl / Opt shortcut resets the buffer and passes through
         if hasCmd || hasCtrl || hasOpt {
             resetTracking()
@@ -1771,6 +1776,45 @@ final class KoEnFixEngine {
         return Unmanaged.passRetained(originalEvent)
     }
 
+    /// A Ctrl combo arrived in Korean mode. Switch the input source to English, converting the
+    /// pending word when Space would convert it, then deliver the combo once English is active.
+    private func handleCtrlCombo(keyCode: CGKeyCode, flags: CGEventFlags, originalEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        let modifiers = InputSourceManager.shortcutModifiers(of: flags)
+        let action = TypoDetector.ctrlComboAction(
+            isInputSourceSwitchHotKey: InputSourceManager.matchesInputSourceSwitchHotKey(
+                keyCode: keyCode,
+                modifiers: modifiers,
+                hotKeys: InputSourceManager.inputSourceSwitchHotKeys()
+            ),
+            sim: buffer.isEmpty ? nil : buffer.snapshot(),
+            mode: mode,
+            prefixSymbol: currentPrefixSymbol
+        )
+        if case .passThrough = action {
+            resetTracking()
+            return Unmanaged.passRetained(originalEvent)
+        }
+
+        let combo = DeferredUserKey(keyCode: keyCode, modifiers: modifiers)
+        resetTracking()
+        switch action {
+        case .convertWord(let sim):
+            performReplacement(
+                deleteCount: sim.backspacesInKoreanComposing,
+                switchToKorean: false,
+                insertText: sim.englishText,
+                fromLabel: sim.koreanText,
+                toLabel: sim.englishText,
+                replayAfter: [combo]
+            )
+        case .switchInputSource:
+            performInputSourceToggle(currentlyKorean: true, replayAfter: [combo])
+        case .passThrough:
+            break
+        }
+        return nil // Consume the combo; it is replayed once English is active
+    }
+
     // MARK: - Deterministic Replacement Sequencer
 
     /// Deterministic 3-phase replacement that avoids all macOS KoreanIM race conditions:
@@ -1782,8 +1826,11 @@ final class KoEnFixEngine {
     ///   1) Send `deleteCount` Backspaces while STILL in English (`ABC`) mode
     ///   2) Inject composed Korean Unicode text while STILL in `ABC` mode (bypasses KoreanIM composition!)
     ///   3) Switch input source to Korean (`2SetKorean`)
-    private func performInputSourceToggle(currentlyKorean: Bool) {
+    private func performInputSourceToggle(currentlyKorean: Bool, replayAfter: [DeferredUserKey] = []) {
         beginReplacing()
+        for key in replayAfter {
+            enqueueDeferredUserKey(key)
+        }
         workerQueue.async { [weak self] in
             if currentlyKorean {
                 InputSourceManager.activateEnglishFromWorker(postShortcut: Self.postSymbolicHotKey)
@@ -1799,9 +1846,13 @@ final class KoEnFixEngine {
         switchToKorean: Bool,
         insertText: String,
         fromLabel: String,
-        toLabel: String
+        toLabel: String,
+        replayAfter: [DeferredUserKey] = []
     ) {
         beginReplacing()
+        for key in replayAfter {
+            enqueueDeferredUserKey(key)
+        }
         recordConversion(from: fromLabel, to: toLabel)
 
         workerQueue.async { [weak self] in
