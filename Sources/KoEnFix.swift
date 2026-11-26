@@ -28,6 +28,16 @@ enum AutoConvertMode: String, CaseIterable {
     }
 }
 
+/// What KoEnFix does when a Ctrl combo arrives while a Korean input source is active.
+enum CtrlComboAction: Equatable {
+    /// A system input-source shortcut such as Ctrl+Space. The system handles it.
+    case passThrough
+    /// Leave the text alone and switch the input source to English.
+    case switchInputSource
+    /// Replace the pending English typo and switch the input source to English.
+    case convertWord(SimulationResult)
+}
+
 struct KeyStroke: Equatable {
     let keyCode: CGKeyCode
     let isShift: Bool
@@ -626,6 +636,21 @@ enum TypoDetector {
         return false
     }
 
+    /// Ctrl combo in Korean mode. The pending word converts when Space would convert it.
+    /// Everything else only switches the input source; manual mode never changes the text.
+    static func ctrlComboAction(
+        isInputSourceSwitchHotKey: Bool,
+        sim: SimulationResult?,
+        mode: AutoConvertMode,
+        prefixSymbol: Character?
+    ) -> CtrlComboAction {
+        if isInputSourceSwitchHotKey { return .passThrough }
+        guard let sim, shouldAutoConvertKoToEn(sim: sim, mode: mode, prefixSymbol: prefixSymbol) else {
+            return .switchInputSource
+        }
+        return .convertWord(sim)
+    }
+
     /// Shift+Space Korean → English. A finished composition (every scalar in
     /// AC00–D7A3, e.g. 안녕, 해) stays Korean. Broken compatibility jamo
     /// (스ㅕㅌ, ㅣㄴ, 치명ㄷ) still converts.
@@ -879,6 +904,74 @@ enum InputSourceManager {
         let modifiers = convertCarbonModifiersToCGFlags(rawModifiers)
         guard !modifiers.isEmpty else { return nil }
         return SymbolicHotKey(keyCode: CGKeyCode(rawKeyCode), modifiers: modifiers)
+    }
+
+    /// The Shift/Ctrl/Opt/Cmd part of event flags. Device-dependent bits are dropped.
+    static func shortcutModifiers(of flags: CGEventFlags) -> CGEventFlags {
+        return flags.intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
+    }
+
+    /// The modifiers a held key is replayed with: the shortcut modifiers plus Fn, which arrow
+    /// keys need to stay Home, End and Page keys.
+    static func keyStrokeModifiers(of flags: CGEventFlags) -> CGEventFlags {
+        var modifiers = shortcutModifiers(of: flags)
+        if flags.contains(.maskSecondaryFn) {
+            modifiers.insert(.maskSecondaryFn)
+        }
+        return modifiers
+    }
+
+    /// Generic and device-dependent flag bits of each modifier. A real key event carries both.
+    /// Fn has no device bit.
+    private static let modifierBits: [(flag: CGEventFlags, deviceBits: CGEventFlags)] = [
+        (.maskShift,       CGEventFlags(rawValue: 0x0006)), // left and right Shift
+        (.maskControl,     CGEventFlags(rawValue: 0x2001)), // left and right Ctrl
+        (.maskAlternate,   CGEventFlags(rawValue: 0x0060)), // left and right Option
+        (.maskCommand,     CGEventFlags(rawValue: 0x0018)), // left and right Cmd
+        (.maskSecondaryFn, [])
+    ]
+
+    /// Generic and device bits of every modifier in `flags`.
+    static func modifierBits(of flags: CGEventFlags) -> CGEventFlags {
+        var bits: CGEventFlags = []
+        for (flag, deviceBits) in modifierBits where flags.contains(flag) {
+            bits.insert(flag)
+            bits.formUnion(deviceBits)
+        }
+        return bits
+    }
+
+    /// Flags for a replayed key stroke. From the keyboard's flags it keeps only the device bits
+    /// of the stroke's own modifiers, so a Shift or Fn pressed in the meantime cannot ride along.
+    /// `modifiers` are always present, even when the user has released them.
+    static func keyStrokeFlags(from flags: CGEventFlags, modifiers: CGEventFlags) -> CGEventFlags {
+        return flags
+            .subtracting(modifierBits(of: flags))
+            .union(flags.intersection(modifierBits(of: modifiers)))
+            .union(modifiers)
+    }
+
+    /// "Select the previous input source" (60) and "Select next source in Input menu" (61).
+    static func inputSourceSwitchHotKeys(from hotKeys: [String: Any]) -> [SymbolicHotKey] {
+        return ["60", "61"].compactMap { parseSymbolicHotKey(from: hotKeys, id: $0) }
+    }
+
+    static func inputSourceSwitchHotKeys() -> [SymbolicHotKey] {
+        guard let domain = UserDefaults.standard.persistentDomain(forName: "com.apple.symbolichotkeys"),
+              let hotKeys = domain["AppleSymbolicHotKeys"] as? [String: Any] else {
+            return []
+        }
+        return inputSourceSwitchHotKeys(from: hotKeys)
+    }
+
+    /// True when the key and its Shift/Ctrl/Opt/Cmd modifiers equal one of `hotKeys`.
+    static func matchesInputSourceSwitchHotKey(
+        keyCode: CGKeyCode,
+        modifiers: CGEventFlags,
+        hotKeys: [SymbolicHotKey]
+    ) -> Bool {
+        let modifiers = shortcutModifiers(of: modifiers)
+        return hotKeys.contains { $0.keyCode == keyCode && $0.modifiers == modifiers }
     }
 
     static func previousInputSourceHotKey() -> SymbolicHotKey? {
@@ -1152,6 +1245,66 @@ struct PendingEnToKoUndo {
     }
 }
 
+// MARK: - Keys Held Back During a Replacement
+
+/// Modifier key codes: Right Cmd, Cmd, Shift, Caps Lock, Opt, Ctrl, Right Shift, Right Opt,
+/// Right Ctrl, Fn.
+fileprivate func isModifierKeyCode(_ keyCode: CGKeyCode) -> Bool {
+    return (54...63).contains(Int(keyCode))
+}
+
+/// A user keystroke held back while a replacement runs, to be replayed afterwards.
+struct DeferredUserKey: Equatable {
+    let keyCode: CGKeyCode
+    /// Shift/Ctrl/Opt/Cmd/Fn only. An unmodified key carries none.
+    let modifiers: CGEventFlags
+
+    /// A Cmd/Ctrl/Opt shortcut. It must reach the app as a modified key stroke.
+    var isCombo: Bool {
+        return !modifiers.intersection([.maskControl, .maskAlternate, .maskCommand]).isEmpty
+    }
+
+    /// The key to hold back while a replacement runs, or nil when the event passes straight through.
+    ///
+    /// Plain keys wait so the next word starts in the new input source. Ctrl shortcuts wait only
+    /// while the Ctrl-combo switch is on, so a shortcut typed after the triggering combo cannot
+    /// overtake it. Cmd and Opt shortcuts and modifier keys are never held.
+    static func held(
+        keyCode: CGKeyCode,
+        flags: CGEventFlags,
+        ctrlComboSwitchEnabled: Bool
+    ) -> DeferredUserKey? {
+        guard !isModifierKeyCode(keyCode) else { return nil }
+        let key = DeferredUserKey(keyCode: keyCode, modifiers: InputSourceManager.keyStrokeModifiers(of: flags))
+        if key.isCombo {
+            guard ctrlComboSwitchEnabled, key.modifiers.contains(.maskControl) else { return nil }
+        }
+        return key
+    }
+}
+
+/// Keys typed during a replacement, in press order.
+struct DeferredKeyQueue {
+    static let cap = 16
+
+    private(set) var keys: [DeferredUserKey] = []
+
+    mutating func enqueue(_ key: DeferredUserKey) {
+        guard keys.count < Self.cap else { return }
+        keys.append(key)
+    }
+
+    mutating func removeAll() {
+        keys.removeAll()
+    }
+
+    mutating func takeAll() -> [DeferredUserKey] {
+        let taken = keys
+        keys.removeAll()
+        return taken
+    }
+}
+
 // MARK: - Keyboard Event Injector & Tap Manager
 
 final class KoEnFixEngine {
@@ -1178,6 +1331,13 @@ final class KoEnFixEngine {
         }
     }
 
+    var switchToEnglishOnCtrlCombo: Bool = true {
+        didSet {
+            UserDefaults.standard.set(switchToEnglishOnCtrlCombo, forKey: "switchToEnglishOnCtrlCombo")
+            onStateChange?()
+        }
+    }
+
     private(set) var recentConversions: [String] = []
     private(set) var learnedList = LearnedEnToKoList()
     var onStateChange: (() -> Void)?
@@ -1193,7 +1353,7 @@ final class KoEnFixEngine {
 
     private let stateLock = NSLock()
     private var isReplacingStorage: Bool = false
-    private var deferredUserKeys: [(keyCode: CGKeyCode, isShift: Bool)] = []
+    private var deferredUserKeys = DeferredKeyQueue()
     private var ignoreSourceChangeNotificationsUntil: TimeInterval = 0
     private var sourceChangeObserverInstalled: Bool = false
     private let selfPID: Int64 = Int64(ProcessInfo.processInfo.processIdentifier)
@@ -1218,31 +1378,41 @@ final class KoEnFixEngine {
         if UserDefaults.standard.object(forKey: "convertOnTerminalEnter") != nil {
             convertOnTerminalEnter = UserDefaults.standard.bool(forKey: "convertOnTerminalEnter")
         }
+        if UserDefaults.standard.object(forKey: "switchToEnglishOnCtrlCombo") != nil {
+            switchToEnglishOnCtrlCombo = UserDefaults.standard.bool(forKey: "switchToEnglishOnCtrlCombo")
+        }
         learnedList = LearnedEnToKoList.loadFromDefaults()
     }
 
-    private func beginReplacing() {
+    /// Starts a replacement. `replayAfter` is queued first, so a combo the tap swallowed on
+    /// purpose is delivered before any key typed after it.
+    fileprivate func beginReplacing(replayAfter: [DeferredUserKey] = []) {
         stateLock.lock()
         isReplacingStorage = true
         deferredUserKeys.removeAll()
+        for key in replayAfter {
+            deferredUserKeys.enqueue(key)
+        }
         ignoreSourceChangeNotificationsUntil = ProcessInfo.processInfo.systemUptime + 0.6
         stateLock.unlock()
     }
 
-    private func enqueueDeferredUserKey(keyCode: CGKeyCode, isShift: Bool) {
+    /// Holds a keystroke while a replacement runs, and returns true so the event is swallowed.
+    /// False when no replacement is running. The check and the enqueue share one lock hold, so a
+    /// key cannot land in the queue after the worker has drained it.
+    fileprivate func holdKeyWhileReplacing(_ key: DeferredUserKey) -> Bool {
         stateLock.lock()
-        if deferredUserKeys.count < 16 {
-            deferredUserKeys.append((keyCode: keyCode, isShift: isShift))
-        }
-        stateLock.unlock()
+        defer { stateLock.unlock() }
+        guard isReplacingStorage else { return false }
+        deferredUserKeys.enqueue(key)
+        return true
     }
 
-    private func finishReplacingAndTakeDeferredKeys() -> [(keyCode: CGKeyCode, isShift: Bool)] {
+    fileprivate func finishReplacingAndTakeDeferredKeys() -> [DeferredUserKey] {
         stateLock.lock()
         isReplacingStorage = false
         ignoreSourceChangeNotificationsUntil = ProcessInfo.processInfo.systemUptime + 0.35
-        let queued = deferredUserKeys
-        deferredUserKeys.removeAll()
+        let queued = deferredUserKeys.takeAll()
         stateLock.unlock()
         return queued
     }
@@ -1372,19 +1542,19 @@ final class KoEnFixEngine {
 
         // While replacing & switching input sources, hold fast follow-up keystrokes and replay
         // them once the target input language is active so the next word starts in the new language.
+        // The hold checks and enqueues under one lock hold: a key must not land in the queue after
+        // the worker drained it.
+        if type == .keyDown,
+           let held = DeferredUserKey.held(
+               keyCode: CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
+               flags: event.flags,
+               ctrlComboSwitchEnabled: switchToEnglishOnCtrlCombo
+           ),
+           holdKeyWhileReplacing(held) {
+            return nil
+        }
         if isReplacing {
-            if type == .keyDown {
-                let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-                let flags = event.flags
-                let isBareModifier = (54...63).contains(Int(keyCode))
-                if !isBareModifier &&
-                   !flags.contains(.maskCommand) &&
-                   !flags.contains(.maskControl) &&
-                   !flags.contains(.maskAlternate) {
-                    enqueueDeferredUserKey(keyCode: keyCode, isShift: flags.contains(.maskShift))
-                    return nil
-                }
-            } else if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
+            if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
                 resetTracking()
             }
             return Unmanaged.passRetained(event)
@@ -1407,6 +1577,11 @@ final class KoEnFixEngine {
         let hasCtrl = flags.contains(.maskControl)
         let hasOpt = flags.contains(.maskAlternate)
         let hasShift = flags.contains(.maskShift)
+
+        // Ctrl combo in Korean mode: switch to English first, then deliver the combo to the app
+        if hasCtrl && !isModifierKeyCode(keyCode) && switchToEnglishOnCtrlCombo && InputSourceManager.isKoreanActive() {
+            return handleCtrlCombo(keyCode: keyCode, flags: flags, originalEvent: event)
+        }
 
         // Any Cmd / Ctrl / Opt shortcut resets the buffer and passes through
         if hasCmd || hasCtrl || hasOpt {
@@ -1654,6 +1829,46 @@ final class KoEnFixEngine {
         return Unmanaged.passRetained(originalEvent)
     }
 
+    /// A Ctrl combo arrived in Korean mode. Switch the input source to English, converting the
+    /// pending word when Space would convert it, then deliver the combo once English is active.
+    private func handleCtrlCombo(keyCode: CGKeyCode, flags: CGEventFlags, originalEvent: CGEvent) -> Unmanaged<CGEvent>? {
+        let modifiers = InputSourceManager.shortcutModifiers(of: flags)
+        let action = TypoDetector.ctrlComboAction(
+            isInputSourceSwitchHotKey: InputSourceManager.matchesInputSourceSwitchHotKey(
+                keyCode: keyCode,
+                modifiers: modifiers,
+                hotKeys: InputSourceManager.inputSourceSwitchHotKeys()
+            ),
+            sim: buffer.isEmpty ? nil : buffer.snapshot(),
+            mode: mode,
+            prefixSymbol: currentPrefixSymbol
+        )
+        if case .passThrough = action {
+            resetTracking()
+            return Unmanaged.passRetained(originalEvent)
+        }
+
+        // Fn rides along with the combo: Ctrl+Fn+Left must not come back as Ctrl+Left.
+        let combo = DeferredUserKey(keyCode: keyCode, modifiers: InputSourceManager.keyStrokeModifiers(of: flags))
+        resetTracking()
+        switch action {
+        case .convertWord(let sim):
+            performReplacement(
+                deleteCount: sim.backspacesInKoreanComposing,
+                switchToKorean: false,
+                insertText: sim.englishText,
+                fromLabel: sim.koreanText,
+                toLabel: sim.englishText,
+                replayAfter: [combo]
+            )
+        case .switchInputSource:
+            performInputSourceToggle(currentlyKorean: true, replayAfter: [combo])
+        case .passThrough:
+            break
+        }
+        return nil // Consume the combo; it is replayed once English is active
+    }
+
     // MARK: - Deterministic Replacement Sequencer
 
     /// Deterministic 3-phase replacement that avoids all macOS KoreanIM race conditions:
@@ -1665,13 +1880,13 @@ final class KoEnFixEngine {
     ///   1) Send `deleteCount` Backspaces while STILL in English (`ABC`) mode
     ///   2) Inject composed Korean Unicode text while STILL in `ABC` mode (bypasses KoreanIM composition!)
     ///   3) Switch input source to Korean (`2SetKorean`)
-    private func performInputSourceToggle(currentlyKorean: Bool) {
-        beginReplacing()
+    private func performInputSourceToggle(currentlyKorean: Bool, replayAfter: [DeferredUserKey] = []) {
+        beginReplacing(replayAfter: replayAfter)
         workerQueue.async { [weak self] in
             if currentlyKorean {
-                InputSourceManager.activateEnglishFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateEnglishFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
             } else {
-                InputSourceManager.activateKoreanFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateKoreanFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
             }
             self?.completeReplacingAndReplay()
         }
@@ -1682,9 +1897,10 @@ final class KoEnFixEngine {
         switchToKorean: Bool,
         insertText: String,
         fromLabel: String,
-        toLabel: String
+        toLabel: String,
+        replayAfter: [DeferredUserKey] = []
     ) {
-        beginReplacing()
+        beginReplacing(replayAfter: replayAfter)
         recordConversion(from: fromLabel, to: toLabel)
 
         workerQueue.async { [weak self] in
@@ -1706,11 +1922,11 @@ final class KoEnFixEngine {
                 usleep(18_000)
 
                 // Phase 3: Activate Korean in the focused app's TSMDocument (not just the menu-bar icon)
-                InputSourceManager.activateKoreanFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateKoreanFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
             } else {
                 // Direction: Korean -> English
                 // Phase 2: Switch IME to English (ABC) first so KoreanIM deactivates before English text arrives
-                InputSourceManager.activateEnglishFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateEnglishFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
 
                 // Phase 3: Inject English text now that ABC is active
                 Self.postUnicodeString(insertText, source: src)
@@ -1724,8 +1940,8 @@ final class KoEnFixEngine {
         usleep(10_000)
         let queued = finishReplacingAndTakeDeferredKeys()
         guard !queued.isEmpty else { return }
-        for item in queued {
-            Self.postReplayedUserKey(keyCode: item.keyCode, isShift: item.isShift)
+        for key in queued {
+            Self.postReplayedUserKey(key)
         }
     }
 
@@ -1740,7 +1956,14 @@ final class KoEnFixEngine {
 
     /// Synthesizes a full hardware-level modifier + key + modifier-release sequence for a macOS SymbolicHotKey.
     /// Preserves native `NX_DEVICE*` modifier bits so `TextInputMenuAgent` immediately commits without leaving HUD open.
-    private static func postSymbolicHotKey(_ hotKey: InputSourceManager.SymbolicHotKey) {
+    ///
+    /// `excludingHeldModifiers` is for a combo the tap is replaying for the user: the key itself
+    /// then carries only the combo's modifiers, so a Shift pressed in the meantime cannot turn
+    /// Ctrl+P into Ctrl+Shift+P. The modifier key events still report the keyboard as it is.
+    private static func postSymbolicHotKey(
+        _ hotKey: InputSourceManager.SymbolicHotKey,
+        excludingHeldModifiers: Bool = false
+    ) {
         let src = CGEventSource(stateID: .hidSystemState)
         let modCodes = modifierKeyCodes(for: hotKey.modifiers)
         guard !modCodes.isEmpty else { return }
@@ -1762,8 +1985,11 @@ final class KoEnFixEngine {
 
         if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: true),
            let keyUp = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: false) {
-            keyDown.flags = activeFlags
-            keyUp.flags = activeFlags
+            let keyFlags = excludingHeldModifiers
+                ? InputSourceManager.keyStrokeFlags(from: activeFlags, modifiers: hotKey.modifiers)
+                : activeFlags
+            keyDown.flags = keyFlags
+            keyUp.flags = keyFlags
             keyDown.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
             keyUp.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
             keyDown.post(tap: .cghidEventTap)
@@ -1785,9 +2011,22 @@ final class KoEnFixEngine {
         }
     }
 
-    private static func postReplayedUserKey(keyCode: CGKeyCode, isShift: Bool) {
+    /// Replays a key held back during a replacement.
+    ///
+    /// A combo goes out as the same modifier + key sequence as the input-source shortcut, so
+    /// system shortcuts such as desktop switching see what a real key press looks like. The key
+    /// carries only the combo's own modifiers. It is tagged as ours, so the tap passes it on
+    /// without switching the input source again.
+    private static func postReplayedUserKey(_ key: DeferredUserKey) {
+        if key.isCombo {
+            postSymbolicHotKey(
+                InputSourceManager.SymbolicHotKey(keyCode: key.keyCode, modifiers: key.modifiers),
+                excludingHeldModifiers: true
+            )
+            return
+        }
         let src = CGEventSource(stateID: .hidSystemState)
-        if isShift {
+        if key.modifiers.contains(.maskShift) {
             let shiftDown = CGEvent(keyboardEventSource: src, virtualKey: 56, keyDown: true)
             let shiftFlags = shiftDown?.flags ?? [.maskShift]
             if let shiftDown {
@@ -1795,8 +2034,8 @@ final class KoEnFixEngine {
                 shiftDown.post(tap: .cghidEventTap)
                 usleep(2_000)
             }
-            if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
-               let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
+            if let down = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: true),
+               let up = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: false) {
                 down.flags = shiftFlags
                 up.flags = shiftFlags
                 down.setIntegerValueField(.eventSourceUserData, value: REPLAY_EVENT_TAG)
@@ -1812,8 +2051,8 @@ final class KoEnFixEngine {
                 usleep(2_000)
             }
         } else {
-            guard let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) else {
+            guard let down = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: false) else {
                 return
             }
             down.flags = []
@@ -2045,6 +2284,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termEnterItem.state = engine.convertOnTerminalEnter ? .on : .off
         menu.addItem(termEnterItem)
 
+        let ctrlComboItem = NSMenuItem(
+            title: "Ctrl 조합키 입력 시 한글 → 영문 전환",
+            action: #selector(toggleCtrlComboSwitch),
+            keyEquivalent: ""
+        )
+        ctrlComboItem.target = self
+        ctrlComboItem.state = engine.switchToEnglishOnCtrlCombo ? .on : .off
+        menu.addItem(ctrlComboItem)
+
         menu.addItem(NSMenuItem.separator())
 
         appendLearnedMenu(menu, title: "Space로 바꿀 영문", words: engine.learnedList.accept)
@@ -2120,6 +2368,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleTerminalEnter() {
         KoEnFixEngine.shared.convertOnTerminalEnter.toggle()
+    }
+
+    @objc private func toggleCtrlComboSwitch() {
+        KoEnFixEngine.shared.switchToEnglishOnCtrlCombo.toggle()
     }
 
     @objc private func openAccessibilitySettings() {
@@ -2378,6 +2630,253 @@ func runSelfTests() -> Int32 {
 
         expect(InputSourceManager.isKoreanSourceID("com.apple.inputmethod.Korean.2SetKorean"), "2SetKorean is recognized as Korean")
         expect(!InputSourceManager.isKoreanSourceID("com.apple.keylayout.ABC"), "ABC is recognized as non-Korean")
+    }
+
+    // 7. Ctrl combo in Korean mode converts the pending word when Space would, else only switches.
+    do {
+        func simulated(_ en: String) -> SimulationResult {
+            HangulAutomata.simulate(HangulAutomata.strokes(fromEnglish: en)!)
+        }
+        func action(
+            _ en: String,
+            hotKey: Bool = false,
+            mode: AutoConvertMode = .conservative,
+            prefix: Character? = nil
+        ) -> CtrlComboAction {
+            TypoDetector.ctrlComboAction(
+                isInputSourceSwitchHotKey: hotKey,
+                sim: simulated(en),
+                mode: mode,
+                prefixSymbol: prefix
+            )
+        }
+        for (en, ko) in [("ls", "ㅣㄴ"), ("tmux", "스ㅕㅌ"), ("git", "햣")] {
+            expect(
+                action(en) == .convertWord(simulated(en)),
+                "Ctrl combo after the English typo '\(ko)' converts it to '\(en)'"
+            )
+            expect(
+                action(en, mode: .aggressive) == .convertWord(simulated(en)),
+                "Aggressive mode also converts '\(ko)' on a Ctrl combo"
+            )
+            expect(
+                action(en, mode: .manualOnly) == .switchInputSource,
+                "Manual mode leaves '\(ko)' as typed and only switches the input source"
+            )
+        }
+        expect(
+            action("q", prefix: ":") == .convertWord(simulated("q")),
+            "Ctrl combo after ':ㅂ' converts the Vim command 'q'"
+        )
+        expect(
+            action("la", prefix: "-") == .convertWord(simulated("la")),
+            "Ctrl combo after '-ㅣㅁ' converts the CLI flag 'la'"
+        )
+        for (en, ko) in [("dkssud", "안녕"), ("go", "해")] {
+            expect(
+                action(en) == .switchInputSource,
+                "Ctrl combo after the real Korean word '\(ko)' only switches the input source"
+            )
+        }
+        expect(
+            TypoDetector.ctrlComboAction(
+                isInputSourceSwitchHotKey: false, sim: nil, mode: .conservative, prefixSymbol: nil
+            ) == .switchInputSource,
+            "Ctrl combo with no pending word only switches the input source"
+        )
+        expect(
+            action("ls", hotKey: true) == .passThrough,
+            "Ctrl+Space stays with the system input-source shortcut"
+        )
+    }
+
+    // 8. Only the system's own input-source shortcuts (60, 61) are left to the system.
+    do {
+        let hotKeys: [String: Any] = [
+            "60": [
+                "enabled": true,
+                "value": [
+                    "parameters": [32, 49, 262144],
+                    "type": "standard"
+                ]
+            ],
+            "61": [
+                "enabled": true,
+                "value": [
+                    "parameters": [32, 49, 786432],
+                    "type": "standard"
+                ]
+            ],
+            "118": [
+                "enabled": true,
+                "value": [
+                    "parameters": [65535, 18, 262144],
+                    "type": "standard"
+                ]
+            ]
+        ]
+        let switchHotKeys = InputSourceManager.inputSourceSwitchHotKeys(from: hotKeys)
+        expect(switchHotKeys.count == 2, "Shortcuts 60 and 61 are the input-source shortcuts; 118 is not")
+        expect(
+            InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 49, modifiers: [.maskControl], hotKeys: switchHotKeys),
+            "Ctrl+Space matches shortcut 60"
+        )
+        expect(
+            InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 49, modifiers: [.maskControl, .maskAlternate], hotKeys: switchHotKeys),
+            "Ctrl+Opt+Space matches shortcut 61"
+        )
+        expect(
+            !InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 49, modifiers: [.maskControl, .maskShift], hotKeys: switchHotKeys),
+            "Ctrl+Shift+Space is not an input-source shortcut"
+        )
+        expect(
+            !InputSourceManager.matchesInputSourceSwitchHotKey(keyCode: 18, modifiers: [.maskControl], hotKeys: switchHotKeys),
+            "Ctrl+1 is not an input-source shortcut"
+        )
+        expect(
+            InputSourceManager.inputSourceSwitchHotKeys(from: ["61": ["enabled": false]]).isEmpty,
+            "A disabled shortcut is ignored"
+        )
+        let physicalCtrl = InputSourceManager.convertCarbonModifiersToCGFlags(262144)
+            .union(CGEventFlags(rawValue: 0x0101))
+        expect(
+            InputSourceManager.shortcutModifiers(of: physicalCtrl) == [.maskControl],
+            "Device-dependent modifier bits are dropped"
+        )
+        let ctrlShiftHeld = InputSourceManager.convertCarbonModifiersToCGFlags(262144 | 131072)
+            .union(CGEventFlags(rawValue: 0x0103))
+        expect(
+            InputSourceManager.keyStrokeFlags(from: ctrlShiftHeld, modifiers: [.maskControl])
+                == CGEventFlags.maskControl.union(CGEventFlags(rawValue: 0x0101)),
+            "Shift pressed after the combo is dropped from a replayed Ctrl combo, key and device bits alike"
+        )
+        expect(
+            InputSourceManager.keyStrokeFlags(from: ctrlShiftHeld, modifiers: [.maskControl, .maskShift]) == ctrlShiftHeld,
+            "Modifiers that belong to the combo are kept"
+        )
+        expect(
+            InputSourceManager.keyStrokeFlags(from: [.maskAlternate, .maskCommand], modifiers: []) == [],
+            "Every modifier can be dropped"
+        )
+        expect(
+            InputSourceManager.keyStrokeFlags(from: [.maskControl], modifiers: [.maskControl, .maskSecondaryFn])
+                == CGEventFlags.maskControl.union(.maskSecondaryFn),
+            "A combo's Fn survives even when the user has already released it"
+        )
+        expect(
+            InputSourceManager.keyStrokeFlags(from: [.maskControl, .maskSecondaryFn], modifiers: [.maskControl])
+                == [.maskControl],
+            "Fn pressed after the combo is dropped from the replayed key"
+        )
+        for (modifier, deviceBits) in [
+            (CGEventFlags.maskControl, CGEventFlags(rawValue: 0x2001)),
+            (CGEventFlags.maskAlternate, CGEventFlags(rawValue: 0x0060)),
+            (CGEventFlags.maskCommand, CGEventFlags(rawValue: 0x0018))
+        ] {
+            let withDeviceBits = modifier.union(deviceBits)
+            expect(
+                InputSourceManager.keyStrokeFlags(from: withDeviceBits, modifiers: modifier) == withDeviceBits,
+                "The device bits of modifier \(modifier.rawValue) are kept"
+            )
+        }
+        expect(
+            InputSourceManager.keyStrokeModifiers(of: [.maskControl, .maskSecondaryFn, CGEventFlags(rawValue: 0x0101)])
+                == CGEventFlags.maskControl.union(.maskSecondaryFn),
+            "A held key keeps Fn and loses device bits"
+        )
+    }
+
+    // 9. Keys typed during a replacement: what waits, and the order it comes out in.
+    do {
+        let ctrl = InputSourceManager.convertCarbonModifiersToCGFlags(262144)
+        let ctrlOpt = InputSourceManager.convertCarbonModifiersToCGFlags(786432)
+        let cmd = InputSourceManager.convertCarbonModifiersToCGFlags(1048576)
+        let opt = InputSourceManager.convertCarbonModifiersToCGFlags(524288)
+
+        expect(
+            DeferredUserKey.held(keyCode: 2, flags: [], ctrlComboSwitchEnabled: false) == DeferredUserKey(keyCode: 2, modifiers: []),
+            "A plain key waits for the new input source"
+        )
+        expect(
+            DeferredUserKey.held(keyCode: 2, flags: [.maskShift], ctrlComboSwitchEnabled: false) == DeferredUserKey(keyCode: 2, modifiers: [.maskShift]),
+            "Shift+key waits for the new input source"
+        )
+        expect(
+            DeferredUserKey.held(keyCode: 32, flags: ctrl, ctrlComboSwitchEnabled: true) == DeferredUserKey(keyCode: 32, modifiers: [.maskControl]),
+            "With the Ctrl-combo switch on, a Ctrl combo waits behind the combo that triggered the replacement"
+        )
+        expect(
+            DeferredUserKey.held(keyCode: 32, flags: ctrl, ctrlComboSwitchEnabled: false) == nil,
+            "With the switch off, a Ctrl combo passes straight through"
+        )
+        let shift = InputSourceManager.convertCarbonModifiersToCGFlags(131072)
+        for (name, extra) in [("Shift", shift), ("Opt", opt), ("Cmd", cmd)] {
+            expect(
+                DeferredUserKey.held(
+                    keyCode: 44,
+                    flags: ctrl.union(extra).union(CGEventFlags(rawValue: 0x0009)),
+                    ctrlComboSwitchEnabled: true
+                ) == DeferredUserKey(keyCode: 44, modifiers: CGEventFlags.maskControl.union(extra)),
+                "Ctrl+\(name)+key waits with both modifiers kept and device bits dropped"
+            )
+            expect(
+                DeferredUserKey.held(keyCode: 44, flags: ctrl.union(extra), ctrlComboSwitchEnabled: false) == nil,
+                "With the switch off, Ctrl+\(name)+key passes straight through"
+            )
+        }
+        expect(
+            DeferredUserKey.held(
+                keyCode: 123,
+                flags: ctrl.union(.maskSecondaryFn),
+                ctrlComboSwitchEnabled: true
+            ) == DeferredUserKey(keyCode: 123, modifiers: [.maskControl, .maskSecondaryFn]),
+            "Ctrl+Fn+arrow waits with Fn kept, so it is not replayed as a plain arrow"
+        )
+        expect(DeferredUserKey.held(keyCode: 8, flags: cmd, ctrlComboSwitchEnabled: true) == nil, "A Cmd shortcut is never held")
+        expect(DeferredUserKey.held(keyCode: 8, flags: opt, ctrlComboSwitchEnabled: true) == nil, "An Opt shortcut is never held")
+        expect(DeferredUserKey.held(keyCode: 59, flags: ctrl, ctrlComboSwitchEnabled: true) == nil, "A modifier key is never held")
+
+        expect(DeferredUserKey(keyCode: 32, modifiers: [.maskControl]).isCombo, "A Ctrl combo is a combo")
+        expect(DeferredUserKey(keyCode: 8, modifiers: ctrlOpt.union(cmd)).isCombo, "Ctrl+Opt+Cmd is a combo")
+        expect(!DeferredUserKey(keyCode: 2, modifiers: [.maskShift]).isCombo, "Shift+key is not a combo")
+
+        var queue = DeferredKeyQueue()
+        queue.enqueue(DeferredUserKey(keyCode: 32, modifiers: [.maskControl]))
+        queue.enqueue(DeferredUserKey(keyCode: 2, modifiers: []))
+        queue.enqueue(DeferredUserKey(keyCode: 13, modifiers: [.maskControl]))
+        expect(queue.keys.map { $0.keyCode } == [32, 2, 13], "Held keys keep press order")
+        for code in 0..<20 {
+            queue.enqueue(DeferredUserKey(keyCode: CGKeyCode(code), modifiers: []))
+        }
+        expect(queue.keys.count == DeferredKeyQueue.cap, "At most \(DeferredKeyQueue.cap) keys are held")
+        expect(queue.keys.prefix(3).map { $0.keyCode } == [32, 2, 13], "The earliest keys, the triggering combo first, are kept")
+        queue.removeAll()
+        expect(queue.keys.isEmpty, "removeAll empties the queue")
+        queue.enqueue(DeferredUserKey(keyCode: 5, modifiers: []))
+        let taken = queue.takeAll()
+        expect(taken.map { $0.keyCode } == [5] && queue.keys.isEmpty, "takeAll hands over everything once")
+    }
+
+    // 10. The engine holds keys across a replacement and replays the triggering combo first.
+    do {
+        let engine = KoEnFixEngine.shared
+        let combo = DeferredUserKey(keyCode: 32, modifiers: [.maskControl])
+        let typed = DeferredUserKey(keyCode: 2, modifiers: [])
+        let shifted = DeferredUserKey(keyCode: 5, modifiers: [.maskShift])
+
+        expect(!engine.holdKeyWhileReplacing(typed), "Outside a replacement no key is held")
+
+        engine.beginReplacing(replayAfter: [combo])
+        expect(engine.holdKeyWhileReplacing(typed), "A key typed during a replacement is held")
+        expect(engine.holdKeyWhileReplacing(shifted), "A Shift+key typed during a replacement is held")
+        expect(
+            engine.finishReplacingAndTakeDeferredKeys() == [combo, typed, shifted],
+            "The triggering combo is replayed first, then the later keys in press order"
+        )
+
+        expect(!engine.holdKeyWhileReplacing(typed), "Once the replacement ends no key is held")
+        engine.beginReplacing()
+        expect(engine.finishReplacingAndTakeDeferredKeys().isEmpty, "A replacement without a trigger replays nothing")
     }
 
     if failures == 0 {
