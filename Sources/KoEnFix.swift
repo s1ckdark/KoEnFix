@@ -911,6 +911,25 @@ enum InputSourceManager {
         return flags.intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
     }
 
+    /// Generic and device-dependent flag bits of each modifier. A real key event carries both.
+    private static let modifierBits: [(flag: CGEventFlags, deviceBits: CGEventFlags)] = [
+        (.maskShift,     CGEventFlags(rawValue: 0x0006)), // left and right Shift
+        (.maskControl,   CGEventFlags(rawValue: 0x2001)), // left and right Ctrl
+        (.maskAlternate, CGEventFlags(rawValue: 0x0060)), // left and right Option
+        (.maskCommand,   CGEventFlags(rawValue: 0x0018))  // left and right Cmd
+    ]
+
+    /// `flags` without any modifier other than `kept`. Used when a held combo is replayed: a
+    /// modifier the user started pressing after the combo must not ride along with it.
+    static func droppingModifiers(in flags: CGEventFlags, except kept: CGEventFlags) -> CGEventFlags {
+        var foreign: CGEventFlags = []
+        for (flag, deviceBits) in modifierBits where !kept.contains(flag) {
+            foreign.insert(flag)
+            foreign.formUnion(deviceBits)
+        }
+        return flags.subtracting(foreign)
+    }
+
     /// "Select the previous input source" (60) and "Select next source in Input menu" (61).
     static func inputSourceSwitchHotKeys(from hotKeys: [String: Any]) -> [SymbolicHotKey] {
         return ["60", "61"].compactMap { parseSymbolicHotKey(from: hotKeys, id: $0) }
@@ -1833,9 +1852,9 @@ final class KoEnFixEngine {
         }
         workerQueue.async { [weak self] in
             if currentlyKorean {
-                InputSourceManager.activateEnglishFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateEnglishFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
             } else {
-                InputSourceManager.activateKoreanFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateKoreanFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
             }
             self?.completeReplacingAndReplay()
         }
@@ -1874,11 +1893,11 @@ final class KoEnFixEngine {
                 usleep(18_000)
 
                 // Phase 3: Activate Korean in the focused app's TSMDocument (not just the menu-bar icon)
-                InputSourceManager.activateKoreanFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateKoreanFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
             } else {
                 // Direction: Korean -> English
                 // Phase 2: Switch IME to English (ABC) first so KoreanIM deactivates before English text arrives
-                InputSourceManager.activateEnglishFromWorker(postShortcut: Self.postSymbolicHotKey)
+                InputSourceManager.activateEnglishFromWorker(postShortcut: { Self.postSymbolicHotKey($0) })
 
                 // Phase 3: Inject English text now that ABC is active
                 Self.postUnicodeString(insertText, source: src)
@@ -1908,7 +1927,14 @@ final class KoEnFixEngine {
 
     /// Synthesizes a full hardware-level modifier + key + modifier-release sequence for a macOS SymbolicHotKey.
     /// Preserves native `NX_DEVICE*` modifier bits so `TextInputMenuAgent` immediately commits without leaving HUD open.
-    private static func postSymbolicHotKey(_ hotKey: InputSourceManager.SymbolicHotKey) {
+    ///
+    /// `excludingHeldModifiers` is for a combo the tap is replaying for the user: the key itself
+    /// then carries only the combo's modifiers, so a Shift pressed in the meantime cannot turn
+    /// Ctrl+P into Ctrl+Shift+P. The modifier key events still report the keyboard as it is.
+    private static func postSymbolicHotKey(
+        _ hotKey: InputSourceManager.SymbolicHotKey,
+        excludingHeldModifiers: Bool = false
+    ) {
         let src = CGEventSource(stateID: .hidSystemState)
         let modCodes = modifierKeyCodes(for: hotKey.modifiers)
         guard !modCodes.isEmpty else { return }
@@ -1930,8 +1956,11 @@ final class KoEnFixEngine {
 
         if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: true),
            let keyUp = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: false) {
-            keyDown.flags = activeFlags
-            keyUp.flags = activeFlags
+            let keyFlags = excludingHeldModifiers
+                ? InputSourceManager.droppingModifiers(in: activeFlags, except: hotKey.modifiers)
+                : activeFlags
+            keyDown.flags = keyFlags
+            keyUp.flags = keyFlags
             keyDown.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
             keyUp.setIntegerValueField(.eventSourceUserData, value: SELF_EVENT_TAG)
             keyDown.post(tap: .cghidEventTap)
@@ -1956,11 +1985,15 @@ final class KoEnFixEngine {
     /// Replays a key held back during a replacement.
     ///
     /// A combo goes out as the same modifier + key sequence as the input-source shortcut, so
-    /// system shortcuts such as desktop switching see what a real key press looks like. It is
-    /// tagged as ours, so the tap passes it on without switching the input source again.
+    /// system shortcuts such as desktop switching see what a real key press looks like. The key
+    /// carries only the combo's own modifiers. It is tagged as ours, so the tap passes it on
+    /// without switching the input source again.
     private static func postReplayedUserKey(_ key: DeferredUserKey) {
         if key.isCombo {
-            postSymbolicHotKey(InputSourceManager.SymbolicHotKey(keyCode: key.keyCode, modifiers: key.modifiers))
+            postSymbolicHotKey(
+                InputSourceManager.SymbolicHotKey(keyCode: key.keyCode, modifiers: key.modifiers),
+                excludingHeldModifiers: true
+            )
             return
         }
         let src = CGEventSource(stateID: .hidSystemState)
@@ -2676,6 +2709,21 @@ func runSelfTests() -> Int32 {
         expect(
             InputSourceManager.shortcutModifiers(of: physicalCtrl) == [.maskControl],
             "Device-dependent modifier bits are dropped"
+        )
+        let ctrlShiftHeld = InputSourceManager.convertCarbonModifiersToCGFlags(262144 | 131072)
+            .union(CGEventFlags(rawValue: 0x0103))
+        expect(
+            InputSourceManager.droppingModifiers(in: ctrlShiftHeld, except: [.maskControl])
+                == CGEventFlags.maskControl.union(CGEventFlags(rawValue: 0x0101)),
+            "Shift pressed after the combo is dropped from a replayed Ctrl combo, key and device bits alike"
+        )
+        expect(
+            InputSourceManager.droppingModifiers(in: ctrlShiftHeld, except: [.maskControl, .maskShift]) == ctrlShiftHeld,
+            "Modifiers that belong to the combo are kept"
+        )
+        expect(
+            InputSourceManager.droppingModifiers(in: [.maskAlternate, .maskCommand], except: []) == [],
+            "Every modifier can be dropped"
         )
     }
 
