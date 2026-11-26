@@ -911,23 +911,44 @@ enum InputSourceManager {
         return flags.intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
     }
 
+    /// The modifiers a held key is replayed with: the shortcut modifiers plus Fn, which arrow
+    /// keys need to stay Home, End and Page keys.
+    static func keyStrokeModifiers(of flags: CGEventFlags) -> CGEventFlags {
+        var modifiers = shortcutModifiers(of: flags)
+        if flags.contains(.maskSecondaryFn) {
+            modifiers.insert(.maskSecondaryFn)
+        }
+        return modifiers
+    }
+
     /// Generic and device-dependent flag bits of each modifier. A real key event carries both.
+    /// Fn has no device bit.
     private static let modifierBits: [(flag: CGEventFlags, deviceBits: CGEventFlags)] = [
-        (.maskShift,     CGEventFlags(rawValue: 0x0006)), // left and right Shift
-        (.maskControl,   CGEventFlags(rawValue: 0x2001)), // left and right Ctrl
-        (.maskAlternate, CGEventFlags(rawValue: 0x0060)), // left and right Option
-        (.maskCommand,   CGEventFlags(rawValue: 0x0018))  // left and right Cmd
+        (.maskShift,       CGEventFlags(rawValue: 0x0006)), // left and right Shift
+        (.maskControl,     CGEventFlags(rawValue: 0x2001)), // left and right Ctrl
+        (.maskAlternate,   CGEventFlags(rawValue: 0x0060)), // left and right Option
+        (.maskCommand,     CGEventFlags(rawValue: 0x0018)), // left and right Cmd
+        (.maskSecondaryFn, [])
     ]
 
-    /// `flags` without any modifier other than `kept`. Used when a held combo is replayed: a
-    /// modifier the user started pressing after the combo must not ride along with it.
-    static func droppingModifiers(in flags: CGEventFlags, except kept: CGEventFlags) -> CGEventFlags {
-        var foreign: CGEventFlags = []
-        for (flag, deviceBits) in modifierBits where !kept.contains(flag) {
-            foreign.insert(flag)
-            foreign.formUnion(deviceBits)
+    /// Generic and device bits of every modifier in `flags`.
+    static func modifierBits(of flags: CGEventFlags) -> CGEventFlags {
+        var bits: CGEventFlags = []
+        for (flag, deviceBits) in modifierBits where flags.contains(flag) {
+            bits.insert(flag)
+            bits.formUnion(deviceBits)
         }
-        return flags.subtracting(foreign)
+        return bits
+    }
+
+    /// Flags for a replayed key stroke. From the keyboard's flags it keeps only the device bits
+    /// of the stroke's own modifiers, so a Shift or Fn pressed in the meantime cannot ride along.
+    /// `modifiers` are always present, even when the user has released them.
+    static func keyStrokeFlags(from flags: CGEventFlags, modifiers: CGEventFlags) -> CGEventFlags {
+        return flags
+            .subtracting(modifierBits(of: flags))
+            .union(flags.intersection(modifierBits(of: modifiers)))
+            .union(modifiers)
     }
 
     /// "Select the previous input source" (60) and "Select next source in Input menu" (61).
@@ -1235,7 +1256,7 @@ fileprivate func isModifierKeyCode(_ keyCode: CGKeyCode) -> Bool {
 /// A user keystroke held back while a replacement runs, to be replayed afterwards.
 struct DeferredUserKey: Equatable {
     let keyCode: CGKeyCode
-    /// Shift/Ctrl/Opt/Cmd only. An unmodified key carries none.
+    /// Shift/Ctrl/Opt/Cmd/Fn only. An unmodified key carries none.
     let modifiers: CGEventFlags
 
     /// A Cmd/Ctrl/Opt shortcut. It must reach the app as a modified key stroke.
@@ -1254,7 +1275,7 @@ struct DeferredUserKey: Equatable {
         ctrlComboSwitchEnabled: Bool
     ) -> DeferredUserKey? {
         guard !isModifierKeyCode(keyCode) else { return nil }
-        let key = DeferredUserKey(keyCode: keyCode, modifiers: InputSourceManager.shortcutModifiers(of: flags))
+        let key = DeferredUserKey(keyCode: keyCode, modifiers: InputSourceManager.keyStrokeModifiers(of: flags))
         if key.isCombo {
             guard ctrlComboSwitchEnabled, key.modifiers.contains(.maskControl) else { return nil }
         }
@@ -1827,7 +1848,8 @@ final class KoEnFixEngine {
             return Unmanaged.passRetained(originalEvent)
         }
 
-        let combo = DeferredUserKey(keyCode: keyCode, modifiers: modifiers)
+        // Fn rides along with the combo: Ctrl+Fn+Left must not come back as Ctrl+Left.
+        let combo = DeferredUserKey(keyCode: keyCode, modifiers: InputSourceManager.keyStrokeModifiers(of: flags))
         resetTracking()
         switch action {
         case .convertWord(let sim):
@@ -1964,7 +1986,7 @@ final class KoEnFixEngine {
         if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: true),
            let keyUp = CGEvent(keyboardEventSource: src, virtualKey: hotKey.keyCode, keyDown: false) {
             let keyFlags = excludingHeldModifiers
-                ? InputSourceManager.droppingModifiers(in: activeFlags, except: hotKey.modifiers)
+                ? InputSourceManager.keyStrokeFlags(from: activeFlags, modifiers: hotKey.modifiers)
                 : activeFlags
             keyDown.flags = keyFlags
             keyUp.flags = keyFlags
@@ -2724,17 +2746,43 @@ func runSelfTests() -> Int32 {
         let ctrlShiftHeld = InputSourceManager.convertCarbonModifiersToCGFlags(262144 | 131072)
             .union(CGEventFlags(rawValue: 0x0103))
         expect(
-            InputSourceManager.droppingModifiers(in: ctrlShiftHeld, except: [.maskControl])
+            InputSourceManager.keyStrokeFlags(from: ctrlShiftHeld, modifiers: [.maskControl])
                 == CGEventFlags.maskControl.union(CGEventFlags(rawValue: 0x0101)),
             "Shift pressed after the combo is dropped from a replayed Ctrl combo, key and device bits alike"
         )
         expect(
-            InputSourceManager.droppingModifiers(in: ctrlShiftHeld, except: [.maskControl, .maskShift]) == ctrlShiftHeld,
+            InputSourceManager.keyStrokeFlags(from: ctrlShiftHeld, modifiers: [.maskControl, .maskShift]) == ctrlShiftHeld,
             "Modifiers that belong to the combo are kept"
         )
         expect(
-            InputSourceManager.droppingModifiers(in: [.maskAlternate, .maskCommand], except: []) == [],
+            InputSourceManager.keyStrokeFlags(from: [.maskAlternate, .maskCommand], modifiers: []) == [],
             "Every modifier can be dropped"
+        )
+        expect(
+            InputSourceManager.keyStrokeFlags(from: [.maskControl], modifiers: [.maskControl, .maskSecondaryFn])
+                == CGEventFlags.maskControl.union(.maskSecondaryFn),
+            "A combo's Fn survives even when the user has already released it"
+        )
+        expect(
+            InputSourceManager.keyStrokeFlags(from: [.maskControl, .maskSecondaryFn], modifiers: [.maskControl])
+                == [.maskControl],
+            "Fn pressed after the combo is dropped from the replayed key"
+        )
+        for (modifier, deviceBits) in [
+            (CGEventFlags.maskControl, CGEventFlags(rawValue: 0x2001)),
+            (CGEventFlags.maskAlternate, CGEventFlags(rawValue: 0x0060)),
+            (CGEventFlags.maskCommand, CGEventFlags(rawValue: 0x0018))
+        ] {
+            let withDeviceBits = modifier.union(deviceBits)
+            expect(
+                InputSourceManager.keyStrokeFlags(from: withDeviceBits, modifiers: modifier) == withDeviceBits,
+                "The device bits of modifier \(modifier.rawValue) are kept"
+            )
+        }
+        expect(
+            InputSourceManager.keyStrokeModifiers(of: [.maskControl, .maskSecondaryFn, CGEventFlags(rawValue: 0x0101)])
+                == CGEventFlags.maskControl.union(.maskSecondaryFn),
+            "A held key keeps Fn and loses device bits"
         )
     }
 
@@ -2776,6 +2824,14 @@ func runSelfTests() -> Int32 {
                 "With the switch off, Ctrl+\(name)+key passes straight through"
             )
         }
+        expect(
+            DeferredUserKey.held(
+                keyCode: 123,
+                flags: ctrl.union(.maskSecondaryFn),
+                ctrlComboSwitchEnabled: true
+            ) == DeferredUserKey(keyCode: 123, modifiers: [.maskControl, .maskSecondaryFn]),
+            "Ctrl+Fn+arrow waits with Fn kept, so it is not replayed as a plain arrow"
+        )
         expect(DeferredUserKey.held(keyCode: 8, flags: cmd, ctrlComboSwitchEnabled: true) == nil, "A Cmd shortcut is never held")
         expect(DeferredUserKey.held(keyCode: 8, flags: opt, ctrlComboSwitchEnabled: true) == nil, "An Opt shortcut is never held")
         expect(DeferredUserKey.held(keyCode: 59, flags: ctrl, ctrlComboSwitchEnabled: true) == nil, "A modifier key is never held")
