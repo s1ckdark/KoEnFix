@@ -867,13 +867,18 @@ These need a real keyboard and IME session, so only the user can run them. They 
 | j | 한글 모드: Ctrl+2 | 영문 모드, 2번 데스크톱으로 이동 |
 | k | VS Code, 한글 모드: Ctrl+P 직후 바로 Shift+글자 | Quick Open이 열림. 명령 팔레트(Ctrl+Shift+P)가 아니어야 함 |
 | l | 한글 모드: `ㅣㄴ` + Space 직후 바로 Ctrl+Space | 변환은 `ls `로 끝나고, Ctrl+Space는 그 뒤에 한 번 전달되어 한글 모드로 바뀜 |
-| m | Terminal, 한글 모드: Ctrl+Fn+← | 커서가 줄 시작으로 이동(Ctrl+Home). 단어 단위 이동(Ctrl+←)으로 바뀌지 않아야 함 |
+| m | TextEdit, 한글 모드: 글을 두 줄쯤 쓴 뒤 둘째 줄에서 Ctrl+Fn+← | 보기가 문서 처음으로 스크롤됨(Ctrl+Home). 커서가 한 단어만 왼쪽으로 가는(Ctrl+←) 일이 없어야 함. 기본 zsh은 두 키를 묶어 두지 않아 터미널에서는 확인할 수 없음 |
 
 If a check fails, the user turns the menu toggle off (that restores the old behavior exactly) and reports the row. The follow-ups are below.
 
 ### Known limit left as is
 
 A key typed in the 4–5 ms after a replacement ends, while the replayed trigger is still being posted, passes straight through and can reach the app before the trigger. Each further queued key widens the window. The window existed before this feature for deferred plain keys. Fix only if the user sees it: keep `isReplacingStorage` true during the replay, drain the queue again afterwards, and let `REPLAY_EVENT_TAG` events bypass `holdKeyWhileReplacing`.
+
+### Pre-existing behavior that this feature does not change
+
+- A plain or Shift+key held during a replacement is still replayed with no Fn, so an Fn+arrow pressed during a replacement loses its Fn. `DeferredUserKey.held` now records Fn on such a key, but the plain replay path posts `flags = []`. Fix if wanted: post `key.modifiers` there.
+- The Shift+key replay takes its flags from the keyboard at replay time, so a modifier the user is holding then rides along. Optional fix: `keyStrokeFlags(from: shiftDown.flags, modifiers: key.modifiers)`.
 
 ---
 
