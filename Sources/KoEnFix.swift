@@ -1205,6 +1205,66 @@ struct PendingEnToKoUndo {
     }
 }
 
+// MARK: - Keys Held Back During a Replacement
+
+/// Modifier key codes: Right Cmd, Cmd, Shift, Caps Lock, Opt, Ctrl, Right Shift, Right Opt,
+/// Right Ctrl, Fn.
+fileprivate func isModifierKeyCode(_ keyCode: CGKeyCode) -> Bool {
+    return (54...63).contains(Int(keyCode))
+}
+
+/// A user keystroke held back while a replacement runs, to be replayed afterwards.
+struct DeferredUserKey: Equatable {
+    let keyCode: CGKeyCode
+    /// Shift/Ctrl/Opt/Cmd only. An unmodified key carries none.
+    let modifiers: CGEventFlags
+
+    /// A Cmd/Ctrl/Opt shortcut. It must reach the app as a modified key stroke.
+    var isCombo: Bool {
+        return !modifiers.intersection([.maskControl, .maskAlternate, .maskCommand]).isEmpty
+    }
+
+    /// The key to hold back while a replacement runs, or nil when the event passes straight through.
+    ///
+    /// Plain keys wait so the next word starts in the new input source. Ctrl shortcuts wait only
+    /// while the Ctrl-combo switch is on, so a shortcut typed after the triggering combo cannot
+    /// overtake it. Cmd and Opt shortcuts and modifier keys are never held.
+    static func held(
+        keyCode: CGKeyCode,
+        flags: CGEventFlags,
+        ctrlComboSwitchEnabled: Bool
+    ) -> DeferredUserKey? {
+        guard !isModifierKeyCode(keyCode) else { return nil }
+        let key = DeferredUserKey(keyCode: keyCode, modifiers: InputSourceManager.shortcutModifiers(of: flags))
+        if key.isCombo {
+            guard ctrlComboSwitchEnabled, key.modifiers.contains(.maskControl) else { return nil }
+        }
+        return key
+    }
+}
+
+/// Keys typed during a replacement, in press order.
+struct DeferredKeyQueue {
+    static let cap = 16
+
+    private(set) var keys: [DeferredUserKey] = []
+
+    mutating func enqueue(_ key: DeferredUserKey) {
+        guard keys.count < Self.cap else { return }
+        keys.append(key)
+    }
+
+    mutating func removeAll() {
+        keys.removeAll()
+    }
+
+    mutating func takeAll() -> [DeferredUserKey] {
+        let taken = keys
+        keys.removeAll()
+        return taken
+    }
+}
+
 // MARK: - Keyboard Event Injector & Tap Manager
 
 final class KoEnFixEngine {
@@ -2540,6 +2600,54 @@ func runSelfTests() -> Int32 {
             InputSourceManager.shortcutModifiers(of: physicalCtrl) == [.maskControl],
             "Device-dependent modifier bits are dropped"
         )
+    }
+
+    // 9. Keys typed during a replacement: what waits, and the order it comes out in.
+    do {
+        let ctrl = InputSourceManager.convertCarbonModifiersToCGFlags(262144)
+        let ctrlOpt = InputSourceManager.convertCarbonModifiersToCGFlags(786432)
+        let cmd = InputSourceManager.convertCarbonModifiersToCGFlags(1048576)
+        let opt = InputSourceManager.convertCarbonModifiersToCGFlags(524288)
+
+        expect(
+            DeferredUserKey.held(keyCode: 2, flags: [], ctrlComboSwitchEnabled: false) == DeferredUserKey(keyCode: 2, modifiers: []),
+            "A plain key waits for the new input source"
+        )
+        expect(
+            DeferredUserKey.held(keyCode: 2, flags: [.maskShift], ctrlComboSwitchEnabled: false) == DeferredUserKey(keyCode: 2, modifiers: [.maskShift]),
+            "Shift+key waits for the new input source"
+        )
+        expect(
+            DeferredUserKey.held(keyCode: 32, flags: ctrl, ctrlComboSwitchEnabled: true) == DeferredUserKey(keyCode: 32, modifiers: [.maskControl]),
+            "With the Ctrl-combo switch on, a Ctrl combo waits behind the combo that triggered the replacement"
+        )
+        expect(
+            DeferredUserKey.held(keyCode: 32, flags: ctrl, ctrlComboSwitchEnabled: false) == nil,
+            "With the switch off, a Ctrl combo passes straight through"
+        )
+        expect(DeferredUserKey.held(keyCode: 8, flags: cmd, ctrlComboSwitchEnabled: true) == nil, "A Cmd shortcut is never held")
+        expect(DeferredUserKey.held(keyCode: 8, flags: opt, ctrlComboSwitchEnabled: true) == nil, "An Opt shortcut is never held")
+        expect(DeferredUserKey.held(keyCode: 59, flags: ctrl, ctrlComboSwitchEnabled: true) == nil, "A modifier key is never held")
+
+        expect(DeferredUserKey(keyCode: 32, modifiers: [.maskControl]).isCombo, "A Ctrl combo is a combo")
+        expect(DeferredUserKey(keyCode: 8, modifiers: ctrlOpt.union(cmd)).isCombo, "Ctrl+Opt+Cmd is a combo")
+        expect(!DeferredUserKey(keyCode: 2, modifiers: [.maskShift]).isCombo, "Shift+key is not a combo")
+
+        var queue = DeferredKeyQueue()
+        queue.enqueue(DeferredUserKey(keyCode: 32, modifiers: [.maskControl]))
+        queue.enqueue(DeferredUserKey(keyCode: 2, modifiers: []))
+        queue.enqueue(DeferredUserKey(keyCode: 13, modifiers: [.maskControl]))
+        expect(queue.keys.map { $0.keyCode } == [32, 2, 13], "Held keys keep press order")
+        for code in 0..<20 {
+            queue.enqueue(DeferredUserKey(keyCode: CGKeyCode(code), modifiers: []))
+        }
+        expect(queue.keys.count == DeferredKeyQueue.cap, "At most \(DeferredKeyQueue.cap) keys are held")
+        expect(queue.keys.prefix(3).map { $0.keyCode } == [32, 2, 13], "The earliest keys, the triggering combo first, are kept")
+        queue.removeAll()
+        expect(queue.keys.isEmpty, "removeAll empties the queue")
+        queue.enqueue(DeferredUserKey(keyCode: 5, modifiers: []))
+        let taken = queue.takeAll()
+        expect(taken.map { $0.keyCode } == [5] && queue.keys.isEmpty, "takeAll hands over everything once")
     }
 
     if failures == 0 {
